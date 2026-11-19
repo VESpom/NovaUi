@@ -1,78 +1,70 @@
--- LocalScript (StarterPlayerScripts). NovaUI goes in ReplicatedStorage as a ModuleScript named "NovaUI".
-local NovaUI = require(game:GetService("ReplicatedStorage"):WaitForChild("NovaUI"))
+-- NovaUI, Kavo-style. Same calls as Kavo UI Library.
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/VESpom/NovaUi/main/source.lua"))()
 
-local Window = NovaUI.new({
-	Title = "My Hub",
-	Subtitle = "v1.0",
-	-- Accent = Color3.fromRGB(80, 160, 255),  -- change the whole theme colour
-	-- ToggleKey = Enum.KeyCode.RightControl,  -- default is RightShift
-	-- Loader = false,                         -- skip the Enter screen
-	OnEnter = function(window) -- runs after the loading screen; receives the window
-		window:Notify("Welcome", "Press RightShift to hide/show the menu.", 5)
-	end,
-})
+local Window = Library.CreateLib("TITLE", "DarkTheme")   -- LightTheme, DarkTheme, GrapeTheme, BloodTheme, Ocean, Midnight, Sentinel, Synapse
+-- Optional NovaUI extras as a 3rd argument: { Loader = false, ToggleKey = Enum.KeyCode.RightControl, Parent = someGui }
 
--- Each Window:Tab() adds a tab in the sidebar. Everything you add to it appears underneath, in order.
-local Main = Window:Tab("Main")
-local Settings = Window:Tab("Settings")
+local Tab = Window:NewTab("TabName")
+local Section = Tab:NewSection("Section Name")
+Section:UpdateSection("Section New Title")
 
-Main:Section("Buttons")
+local label = Section:NewLabel("LabelText")
+label:UpdateLabel("New Text")
 
--- Button(text, function() ...your code... end, style)
-Main:Button("Default button", function()
-	print("clicked!")
+local button = Section:NewButton("ButtonText", "ButtonInfo", function()
+	print("Clicked")
 end)
+button:UpdateButton("New Text")
 
-Main:Button("Open settings tab", function()
-	Window:SelectTab("Settings") -- a button that opens another tab
-end, { Style = "Sweep", Icon = ">" })
-
-Main:Button("Pill button", function()
-	Window:Notify("Pill", "Hover me for the expanding effect", 3)
-end, { Style = "Pill", Icon = "+" })
-
-Main:Button("Push button", function()
-	print("pushed")
-end, { Style = "Push", Tooltip = { Title = "Info", Text = "Tooltips work on any style." } })
-
-Main:Button("Glow button", function()
-	print("glow")
-end, "Glow")
-
-Main:Section("Toggles")
-
--- Toggle(text, default, function(isOn) ...your code... end)
-local fly = Main:Toggle("Fly", false, function(isOn)
-	print("Fly:", isOn)
+getgenv().Toggled = false
+local toggle = Section:NewToggle("Toggle", "Info", function(state)
+	getgenv().Toggled = state
 end)
-
-Main:Toggle("Another toggle", true, function(isOn)
-	print("Another:", isOn)
-end, { Tooltip = "Starts switched on." })
-
-Main:Section("Sliders and inputs")
-
--- Slider(text, min, max, default, function(value) ...your code... end, { Step = 1, Suffix = "" })
-Main:Slider("WalkSpeed", 16, 100, 16, function(value)
-	local character = game:GetService("Players").LocalPlayer.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if humanoid then
-		humanoid.WalkSpeed = value
+game:GetService("RunService").RenderStepped:Connect(function()
+	if getgenv().Toggled then
+		toggle:UpdateToggle("Toggle On")
+	else
+		toggle:UpdateToggle("Toggle Off")
 	end
-end, { Suffix = " sp" })
-
-Main:Slider("Opacity", 0, 1, 0.5, function(value)
-	print("Opacity:", value)
-end, { Step = 0.05 })
-
-Main:Input("Player name", "type and press Enter", function(text)
-	print("Typed:", text)
 end)
 
-Settings:Label("Anything you add to this tab shows up here.")
-Settings:Toggle("Fly (mirrors the Main toggle)", false, function(isOn)
-	fly:Set(isOn, true) -- true = update the switch without re-running its callback
+Section:NewSlider("SliderText", "SliderInfo", 500, 0, function(s) -- 500 (MaxValue) | 0 (MinValue)
+	game.Players.LocalPlayer.Character.Humanoid.WalkSpeed = s
 end)
-Settings:Button("Close menu", function()
-	Window:Destroy()
-end, "Push")
+
+Section:NewTextBox("TextboxText", "TextboxInfo", function(txt)
+	print(txt)
+end)
+
+Section:NewKeybind("KeybindText", "KeybindInfo", Enum.KeyCode.F, function()
+	Library:ToggleUI()
+end)
+
+local oldList = { "2019", "2020" }
+local newList = { "2021", "2022" }
+local dropdown = Section:NewDropdown("Dropdown", "Info", oldList, function(currentOption)
+	print(currentOption)
+end)
+Section:NewButton("Update Dropdown", "Refreshes Dropdown", function()
+	dropdown:Refresh(newList)
+end)
+
+Section:NewColorPicker("Color Text", "Color Info", Color3.fromRGB(0, 0, 0), function(color)
+	print(color)
+end)
+
+-- Fully customizable UI: a colour picker per theme key, recolouring the UI live
+local ThemeTab = Window:NewTab("Theme")
+local ThemeSection = ThemeTab:NewSection("Colours")
+local themes = {
+	SchemeColor = Color3.fromRGB(150, 120, 255),
+	Background = Color3.fromRGB(13, 13, 18),
+	Header = Color3.fromRGB(19, 19, 26),
+	TextColor = Color3.fromRGB(236, 236, 246),
+	ElementColor = Color3.fromRGB(26, 26, 35),
+}
+for theme, color in pairs(themes) do
+	ThemeSection:NewColorPicker(theme, "Change your " .. theme, color, function(color3)
+		Library:ChangeColor(theme, color3)
+	end)
+end

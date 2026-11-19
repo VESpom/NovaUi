@@ -45,6 +45,89 @@ local DEFAULT_THEME = {
 	White = Color3.fromRGB(255, 255, 255),
 }
 
+local WHITE = Color3.fromRGB(255, 255, 255)
+local BLACK = Color3.fromRGB(0, 0, 0)
+
+local function mix(a, b, t)
+	return Color3.new(a.R + (b.R - a.R) * t, a.G + (b.G - a.G) * t, a.B + (b.B - a.B) * t)
+end
+
+local function luminance(c)
+	return 0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B
+end
+
+-- Kavo-shaped colour schemes. Custom themes use the same five keys.
+local SCHEME_KEYS = { "SchemeColor", "Background", "Header", "TextColor", "ElementColor" }
+local SCHEMES = {
+	DarkTheme = {
+		SchemeColor = Color3.fromRGB(150, 120, 255), Background = Color3.fromRGB(13, 13, 18),
+		Header = Color3.fromRGB(19, 19, 26), TextColor = Color3.fromRGB(236, 236, 246),
+		ElementColor = Color3.fromRGB(26, 26, 35),
+	},
+	LightTheme = {
+		SchemeColor = Color3.fromRGB(80, 120, 255), Background = Color3.fromRGB(245, 245, 250),
+		Header = Color3.fromRGB(230, 230, 238), TextColor = Color3.fromRGB(24, 24, 32),
+		ElementColor = Color3.fromRGB(255, 255, 255),
+	},
+	GrapeTheme = {
+		SchemeColor = Color3.fromRGB(166, 71, 214), Background = Color3.fromRGB(64, 50, 71),
+		Header = Color3.fromRGB(36, 28, 41), TextColor = Color3.fromRGB(255, 255, 255),
+		ElementColor = Color3.fromRGB(74, 58, 84),
+	},
+	BloodTheme = {
+		SchemeColor = Color3.fromRGB(227, 27, 27), Background = Color3.fromRGB(10, 10, 10),
+		Header = Color3.fromRGB(5, 5, 5), TextColor = Color3.fromRGB(255, 255, 255),
+		ElementColor = Color3.fromRGB(20, 20, 20),
+	},
+	Ocean = {
+		SchemeColor = Color3.fromRGB(86, 76, 251), Background = Color3.fromRGB(26, 32, 58),
+		Header = Color3.fromRGB(38, 45, 71), TextColor = Color3.fromRGB(200, 200, 200),
+		ElementColor = Color3.fromRGB(38, 45, 71),
+	},
+	Midnight = {
+		SchemeColor = Color3.fromRGB(26, 189, 158), Background = Color3.fromRGB(44, 62, 82),
+		Header = Color3.fromRGB(57, 81, 105), TextColor = Color3.fromRGB(255, 255, 255),
+		ElementColor = Color3.fromRGB(52, 74, 95),
+	},
+	Sentinel = {
+		SchemeColor = Color3.fromRGB(230, 35, 69), Background = Color3.fromRGB(32, 32, 32),
+		Header = Color3.fromRGB(24, 24, 24), TextColor = Color3.fromRGB(119, 209, 146),
+		ElementColor = Color3.fromRGB(24, 24, 24),
+	},
+	Synapse = {
+		SchemeColor = Color3.fromRGB(152, 99, 53), Background = Color3.fromRGB(13, 15, 12),
+		Header = Color3.fromRGB(36, 38, 35), TextColor = Color3.fromRGB(230, 210, 190),
+		ElementColor = Color3.fromRGB(24, 26, 23),
+	},
+}
+
+-- Fill any missing keys from DarkTheme so partial custom tables still work.
+local function completeScheme(scheme)
+	local out = {}
+	for _, key in ipairs(SCHEME_KEYS) do
+		out[key] = (scheme and scheme[key]) or SCHEMES.DarkTheme[key]
+	end
+	return out
+end
+
+-- Derive the full palette from the five Kavo keys. Mutates `theme` in place
+-- (element code reads theme.X live, so changes show up on the next hover/tween).
+local function applyScheme(theme, scheme)
+	local bg, text, element, accent = scheme.Background, scheme.TextColor, scheme.ElementColor, scheme.SchemeColor
+	local light = luminance(bg) > 0.5
+	theme.Background = bg
+	theme.Panel = scheme.Header
+	theme.Text = text
+	theme.Element = element
+	theme.ElementHover = light and mix(element, BLACK, 0.07) or mix(element, WHITE, 0.07)
+	theme.Accent = accent
+	theme.AccentLight = mix(accent, WHITE, 0.35)
+	theme.Muted = mix(text, bg, 0.45)
+	theme.Off = mix(element, text, 0.22)
+	theme.Stroke = light and BLACK or WHITE
+	theme.White = WHITE
+end
+
 local FONT_REGULAR = Enum.Font.Gotham
 local FONT_MEDIUM = Enum.Font.GothamMedium
 local FONT_BOLD = Enum.Font.GothamBold
@@ -766,6 +849,34 @@ function Library:_buildLoader(options)
 	return card
 end
 
+-- Parent order: explicit option > gethui() > CoreGui (if writable) > PlayerGui.
+local function resolveParent(explicit)
+	if explicit then
+		return explicit
+	end
+	local okHui, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if okHui and hui then
+		return hui
+	end
+	local okCore, core = pcall(function()
+		return game:GetService("CoreGui")
+	end)
+	if okCore and core then
+		local probe = Instance.new("Folder")
+		local writable = pcall(function()
+			probe.Parent = core
+		end)
+		probe:Destroy()
+		if writable then
+			return core
+		end
+	end
+	local player = Players.LocalPlayer
+	return player and player:WaitForChild("PlayerGui")
+end
+
 function Library.new(options)
 	options = options or {}
 	local self = setmetatable({}, Library)
@@ -774,9 +885,11 @@ function Library.new(options)
 	for key, value in pairs(DEFAULT_THEME) do
 		self.Theme[key] = value
 	end
+	self._scheme = completeScheme(options.Scheme)
 	if options.Accent then
-		self.Theme.Accent = options.Accent
+		self._scheme.SchemeColor = options.Accent
 	end
+	applyScheme(self.Theme, self._scheme)
 	local theme = self.Theme
 
 	self._conns = {}
@@ -788,11 +901,20 @@ function Library.new(options)
 	self.Visible = false
 	self.Minimized = false
 
-	local parent = options.Parent
-	if not parent then
-		local player = Players.LocalPlayer
-		parent = player and player:WaitForChild("PlayerGui")
+	-- Re-running the script replaces the old window instead of stacking a second one.
+	local envOk, genv = pcall(function()
+		return getgenv()
+	end)
+	if envOk and type(genv) == "table" and genv.__NovaUI and genv.__NovaUI ~= self then
+		pcall(function()
+			genv.__NovaUI:Destroy()
+		end)
 	end
+	if envOk and type(genv) == "table" then
+		genv.__NovaUI = self
+	end
+
+	local parent = resolveParent(options.Parent)
 
 	self.Gui = create("ScreenGui", {
 		Name = options.Name or "NovaUI",
@@ -1019,6 +1141,9 @@ function Library.new(options)
 		self._loader = self:_buildLoader(options)
 	end
 
+	Library._windows = Library._windows or {}
+	table.insert(Library._windows, self)
+	Library._lastWindow = self
 	return self
 end
 
@@ -1029,6 +1154,21 @@ function Library:Destroy()
 		return
 	end
 	self._destroyed = true
+	-- forget this window; module-level calls fall back to the newest one still alive
+	local live = Library._windows or {}
+	for i, w in ipairs(live) do
+		if w == self then
+			table.remove(live, i)
+			break
+		end
+	end
+	Library._lastWindow = live[#live]
+	local envOk, genv = pcall(function()
+		return getgenv()
+	end)
+	if envOk and type(genv) == "table" and genv.__NovaUI == self then
+		genv.__NovaUI = nil
+	end
 	for _, conn in ipairs(self._conns) do
 		conn:Disconnect()
 	end
@@ -1312,7 +1452,7 @@ function Tab:Toggle(text, default, callback, opts)
 		Text = "",
 		Parent = row,
 	}, { corner(8), stroke(theme.Stroke, 0.93, 1) })
-	textLabel({
+	local nameLabel = textLabel({
 		Name = "Label",
 		Position = UDim2.fromOffset(14, 0),
 		Size = UDim2.new(1, -80, 1, 0),
@@ -1340,6 +1480,10 @@ function Tab:Toggle(text, default, callback, opts)
 	}, { pillCorner() })
 
 	local obj = { Instance = row }
+
+	function obj.SetText(_, newText)
+		nameLabel.Text = tostring(newText)
+	end
 
 	local function render()
 		tween(track, 0.2, { BackgroundColor3 = state and theme.Accent or theme.Off })
@@ -1419,7 +1563,7 @@ function Tab:Slider(text, min, max, default, callback, opts)
 		BorderSizePixel = 0,
 		Parent = row,
 	}, { corner(8), stroke(theme.Stroke, 0.93, 1) })
-	textLabel({
+	local nameLabel = textLabel({
 		Name = "Label",
 		Position = UDim2.fromOffset(14, 6),
 		Size = UDim2.new(1, -100, 0, 20),
@@ -1474,6 +1618,10 @@ function Tab:Slider(text, min, max, default, callback, opts)
 	}, { pillCorner() })
 
 	local obj = { Instance = row }
+
+	function obj.SetText(_, newText)
+		nameLabel.Text = tostring(newText)
+	end
 
 	local function render()
 		local alpha = (value - min) / (max - min)
@@ -1602,24 +1750,337 @@ function Tab:Input(text, placeholder, callback, opts)
 end
 
 ----------------------------------------------------------------------
--- Kavo-style API (drop-in shape for scripts written against Kavo UI)
---   local Library = loadstring(...)()
---   local Window  = Library.CreateLib("TITLE", "DarkTheme")
---   local Tab     = Window:NewTab("Main")
---   local Section = Tab:NewSection("Section")
---   Section:NewButton("Text", "Info", function() end)
+-- More elements: Keybind, Dropdown, ColorPicker
 ----------------------------------------------------------------------
 
-local KAVO_THEMES = {
-	DarkTheme = Color3.fromRGB(150, 120, 255),
-	LightTheme = Color3.fromRGB(70, 130, 255),
-	GrapeTheme = Color3.fromRGB(170, 70, 220),
-	BloodTheme = Color3.fromRGB(215, 45, 55),
-	Ocean = Color3.fromRGB(40, 160, 225),
-	Midnight = Color3.fromRGB(95, 85, 215),
-	Sentinel = Color3.fromRGB(235, 90, 90),
-	Synapse = Color3.fromRGB(70, 205, 165),
-}
+local function keyName(key)
+	local ok, name = pcall(function()
+		return key.Name
+	end)
+	if ok and name then
+		return name
+	end
+	return key == nil and "None" or tostring(key)
+end
+
+-- Keybind(text, defaultKeyCode, function() ... end). Click the key box, then press a key to rebind.
+function Tab:Keybind(text, default, callback, opts)
+	opts = opts or {}
+	local win = self.Window
+	local theme = win.Theme
+	local key = default
+	local listening = false
+	local row = self:_row(40, "Keybind")
+	local card = create("Frame", {
+		Name = "Card",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = theme.Element,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, { corner(8), stroke(theme.Stroke, 0.93, 1) })
+	textLabel({
+		Name = "Label",
+		Position = UDim2.fromOffset(14, 0),
+		Size = UDim2.new(1, -120, 1, 0),
+		Text = tostring(text),
+		TextColor3 = theme.Text,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = card,
+	})
+	local keyButton = create("TextButton", {
+		Name = "Key",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -8, 0.5, 0),
+		Size = UDim2.fromOffset(96, 26),
+		BackgroundColor3 = theme.Background,
+		AutoButtonColor = false,
+		BorderSizePixel = 0,
+		Font = FONT_MEDIUM,
+		TextSize = 13,
+		TextColor3 = theme.Accent,
+		Text = keyName(key),
+		Parent = card,
+	}, { corner(6) })
+
+	local obj = { Instance = row }
+	function obj.Get()
+		return key
+	end
+	function obj.Set(_, newKey)
+		key = newKey
+		keyButton.Text = keyName(key)
+	end
+
+	win:_connect(keyButton.Activated, function()
+		listening = not listening
+		keyButton.Text = listening and "..." or keyName(key)
+	end)
+	win:_connect(UserInputService.InputBegan, function(input, processed)
+		if input.UserInputType ~= Enum.UserInputType.Keyboard then
+			return
+		end
+		if listening then
+			listening = false
+			key = input.KeyCode
+			keyButton.Text = keyName(key)
+			return
+		end
+		if processed then
+			return
+		end
+		if key ~= nil and input.KeyCode == key then
+			safe(callback)
+		end
+	end)
+	win:_attachTip(card, opts.Tooltip)
+	return obj
+end
+
+-- Dropdown(text, list, function(option) ... end). obj:Refresh(newList) swaps the options.
+function Tab:Dropdown(text, list, callback, opts)
+	opts = opts or {}
+	local win = self.Window
+	local theme = win.Theme
+	local ROW, ITEM, MAX_VISIBLE = 40, 30, 5
+	local items = {}
+	local buttons = {}
+	local open = false
+	local row = self:_row(ROW, "Dropdown")
+	local card = create("Frame", {
+		Name = "Card",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = theme.Element,
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+		Parent = row,
+	}, { corner(8), stroke(theme.Stroke, 0.93, 1) })
+	local head = create("TextButton", {
+		Name = "Hit",
+		Size = UDim2.new(1, 0, 0, ROW),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		BorderSizePixel = 0,
+		Text = "",
+		Parent = card,
+	})
+	textLabel({
+		Name = "Label",
+		Position = UDim2.fromOffset(14, 0),
+		Size = UDim2.new(0.5, -14, 1, 0),
+		Text = tostring(text),
+		TextColor3 = theme.Text,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = head,
+	})
+	local valueLabel = textLabel({
+		Name = "Value",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -34, 0, 0),
+		Size = UDim2.new(0.5, -40, 1, 0),
+		Text = "",
+		TextColor3 = theme.Accent,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = head,
+	})
+	local arrow = textLabel({
+		Name = "Arrow",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 0),
+		Size = UDim2.fromOffset(16, ROW),
+		Text = "+",
+		Font = FONT_BOLD,
+		TextColor3 = theme.Muted,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Parent = head,
+	})
+	local listFrame = create("ScrollingFrame", {
+		Name = "List",
+		Position = UDim2.fromOffset(6, ROW + 2),
+		Size = UDim2.new(1, -12, 0, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 2,
+		ScrollBarImageColor3 = theme.Accent,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Parent = card,
+	}, { listLayout(2) })
+
+	local function listHeight()
+		return math.min(#items, MAX_VISIBLE) * (ITEM + 2)
+	end
+
+	local function layout()
+		local h = listHeight()
+		listFrame.Size = UDim2.new(1, -12, 0, h)
+		local target = open and (ROW + 8 + h) or ROW
+		tween(row, 0.2, { Size = UDim2.new(1, 0, 0, target) })
+		arrow.Text = open and "–" or "+"
+	end
+
+	local function setOpen(value)
+		if value and #items == 0 then
+			return
+		end
+		open = value
+		layout()
+	end
+
+	local function rebuild(newItems)
+		for _, b in ipairs(buttons) do
+			b:Destroy()
+		end
+		buttons = {}
+		items = {}
+		for index, item in ipairs(newItems) do
+			items[index] = tostring(item)
+			local b = create("TextButton", {
+				Name = "Option",
+				LayoutOrder = index,
+				Size = UDim2.new(1, 0, 0, ITEM),
+				BackgroundColor3 = theme.Background,
+				AutoButtonColor = false,
+				BorderSizePixel = 0,
+				Font = FONT_MEDIUM,
+				TextSize = 13,
+				TextColor3 = theme.Text,
+				Text = items[index],
+				Parent = listFrame,
+			}, { corner(6) })
+			win:_connect(b.MouseEnter, function()
+				tween(b, 0.1, { BackgroundColor3 = theme.ElementHover })
+			end)
+			win:_connect(b.MouseLeave, function()
+				tween(b, 0.1, { BackgroundColor3 = theme.Background })
+			end)
+			win:_connect(b.Activated, function()
+				valueLabel.Text = items[index]
+				setOpen(false)
+				safe(callback, items[index])
+			end)
+			buttons[index] = b
+		end
+		if open then
+			if #items == 0 then
+				open = false
+			end
+			layout()
+		else
+			listFrame.Size = UDim2.new(1, -12, 0, listHeight())
+		end
+	end
+
+	win:_connect(head.Activated, function()
+		setOpen(not open)
+	end)
+	win:_attachTip(head, opts.Tooltip)
+	rebuild(type(list) == "table" and list or {})
+
+	return {
+		Instance = row,
+		Refresh = function(_, newList)
+			if type(newList) ~= "table" then
+				warn("[NovaUI] Dropdown:Refresh expects a table")
+				return
+			end
+			rebuild(newList)
+		end,
+	}
+end
+
+-- ColorPicker(text, defaultColor3, function(color3) ... end). Click to expand R/G/B sliders.
+function Tab:ColorPicker(text, default, callback, opts)
+	opts = opts or {}
+	local win = self.Window
+	local theme = win.Theme
+	local ROW, PANEL = 40, 3 * 56 + 2 * 6
+	local color = default or Color3.fromRGB(255, 255, 255)
+	local r = math.floor(color.R * 255 + 0.5)
+	local g = math.floor(color.G * 255 + 0.5)
+	local b = math.floor(color.B * 255 + 0.5)
+	local open = false
+	local row = self:_row(ROW, "ColorPicker")
+	local card = create("Frame", {
+		Name = "Card",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = theme.Element,
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+		Parent = row,
+	}, { corner(8), stroke(theme.Stroke, 0.93, 1) })
+	local head = create("TextButton", {
+		Name = "Hit",
+		Size = UDim2.new(1, 0, 0, ROW),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		BorderSizePixel = 0,
+		Text = "",
+		Parent = card,
+	})
+	textLabel({
+		Name = "Label",
+		Position = UDim2.fromOffset(14, 0),
+		Size = UDim2.new(1, -70, 1, 0),
+		Text = tostring(text),
+		TextColor3 = theme.Text,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = head,
+	})
+	local swatch = create("Frame", {
+		Name = "Swatch",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.fromOffset(34, 20),
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+		Parent = head,
+	}, { corner(6), stroke(theme.Stroke, 0.7, 1) })
+	local panel = create("Frame", {
+		Name = "Panel",
+		Position = UDim2.fromOffset(8, ROW + 4),
+		Size = UDim2.new(1, -16, 0, PANEL),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = card,
+	}, { listLayout(6) })
+	local host = setmetatable({ Window = win, Name = "ColorPanel", Page = panel, _order = 0 }, Tab)
+
+	local function push()
+		color = Color3.fromRGB(r, g, b)
+		swatch.BackgroundColor3 = color
+		safe(callback, color)
+	end
+	host:Slider("Red", 0, 255, r, function(v)
+		r = v
+		push()
+	end)
+	host:Slider("Green", 0, 255, g, function(v)
+		g = v
+		push()
+	end)
+	host:Slider("Blue", 0, 255, b, function(v)
+		b = v
+		push()
+	end)
+
+	win:_connect(head.Activated, function()
+		open = not open
+		tween(row, 0.25, { Size = UDim2.new(1, 0, 0, open and (ROW + PANEL + 12) or ROW) }, STYLE_QUART)
+	end)
+	win:_attachTip(head, opts.Tooltip)
+
+	return {
+		Instance = row,
+		Get = function()
+			return color
+		end,
+	}
+end
+
+----------------------------------------------------------------------
+-- Kavo-style API (same calls as Kavo UI Library)
+----------------------------------------------------------------------
 
 local function tipFor(name, info)
 	if type(info) == "string" and info ~= "" then
@@ -1633,7 +2094,10 @@ Section.__index = Section
 local KavoTab = {}
 KavoTab.__index = KavoTab
 
--- CreateLib(title, theme [, options]) - theme is a Kavo theme name or a Color3 accent.
+-- CreateLib(title, theme [, options])
+--   theme: "DarkTheme" | "LightTheme" | "GrapeTheme" | "BloodTheme" | "Ocean" | "Midnight" | "Sentinel" | "Synapse"
+--          or a colour table { SchemeColor, Background, Header, TextColor, ElementColor }
+--   options (NovaUI extra): { Loader = false, Parent = gui, ToggleKey = Enum.KeyCode.X, OnEnter = fn }
 function Library.CreateLib(title, theme, options)
 	local opts = {}
 	if type(options) == "table" then
@@ -1642,14 +2106,16 @@ function Library.CreateLib(title, theme, options)
 		end
 	end
 	opts.Title = opts.Title or tostring(title or "NovaUI")
-	if theme ~= nil and opts.Accent == nil then
+	if theme ~= nil and opts.Scheme == nil then
 		if type(theme) == "string" then
-			opts.Accent = KAVO_THEMES[theme]
-			if not opts.Accent then
+			opts.Scheme = SCHEMES[theme]
+			if not opts.Scheme then
 				warn("[NovaUI] unknown theme '" .. theme .. "', using DarkTheme")
 			end
+		elseif type(theme) == "table" and theme.R == nil then
+			opts.Scheme = theme
 		else
-			opts.Accent = theme -- assume Color3
+			opts.Scheme = { SchemeColor = theme } -- a lone Color3 = accent colour
 		end
 	end
 	return Library.new(opts)
@@ -1659,11 +2125,83 @@ function Library:NewTab(name)
 	return setmetatable({ _tab = self:Tab(name) }, KavoTab)
 end
 
-Library.ToggleUI = Library.ToggleVisible
+local function targetWindow(self)
+	if self ~= Library and type(self) == "table" and self._main then
+		return self
+	end
+	return Library._lastWindow
+end
+
+-- Works as Library:ToggleUI() (last window) and Window:ToggleUI().
+function Library.ToggleUI(self)
+	local win = targetWindow(self)
+	if win and not win._destroyed then
+		win:ToggleVisible()
+	end
+end
+
+-- Library:ChangeColor("SchemeColor" | "Background" | "Header" | "TextColor" | "ElementColor", Color3)
+function Library.ChangeColor(self, key, color)
+	local win = targetWindow(self)
+	if not win or win._destroyed then
+		return
+	end
+	if win._scheme[key] == nil then
+		warn("[NovaUI] ChangeColor: unknown key '" .. tostring(key) .. "'")
+		return
+	end
+	local old = {}
+	for k, v in pairs(win.Theme) do
+		old[k] = v
+	end
+	win._scheme[key] = color
+	applyScheme(win.Theme, win._scheme)
+
+	local changes = {}
+	for k, newValue in pairs(win.Theme) do
+		if old[k] ~= newValue then
+			table.insert(changes, { old[k], newValue })
+		end
+	end
+	local props = { "BackgroundColor3", "TextColor3", "ScrollBarImageColor3", "PlaceholderColor3", "Color" }
+	for _, d in ipairs(win.Gui:GetDescendants()) do
+		for _, prop in ipairs(props) do
+			local ok, value = pcall(function()
+				return d[prop]
+			end)
+			if ok and value ~= nil then
+				for _, change in ipairs(changes) do
+					if value == change[1] then
+						pcall(function()
+							d[prop] = change[2]
+						end)
+						break
+					end
+				end
+			end
+		end
+	end
+end
 
 function KavoTab:NewSection(name)
-	self._tab:Section(name)
-	return setmetatable({ _tab = self._tab }, Section)
+	local tab = self._tab
+	tab._order = tab._order + 1
+	local body = create("Frame", {
+		Name = "SectionBody",
+		LayoutOrder = tab._order,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = tab.Page,
+	}, { listLayout(8) })
+	-- a tab-shaped host whose page is this section's body: elements land inside the section
+	local host = setmetatable({ Window = tab.Window, Name = tab.Name, Page = body, _order = 0 }, Tab)
+	return setmetatable({ _tab = host, _header = host:Section(name) }, Section)
+end
+
+function Section:UpdateSection(newTitle)
+	self._header:Set(newTitle)
 end
 
 function Section:NewButton(name, info, callback)
@@ -1678,8 +2216,14 @@ end
 function Section:NewToggle(name, info, callback)
 	local obj = self._tab:Toggle(name, false, callback, { Tooltip = tipFor(name, info) })
 	return {
-		UpdateToggle = function(_, _, state)
-			obj:Set(state == true)
+		-- UpdateToggle(newText [, isOn]) - text only if isOn is omitted
+		UpdateToggle = function(_, newText, isOn)
+			if newText ~= nil then
+				obj:SetText(newText)
+			end
+			if isOn ~= nil then
+				obj:Set(isOn == true, true)
+			end
 		end,
 	}
 end
@@ -1689,8 +2233,13 @@ function Section:NewSlider(name, info, maxValue, minValue, callback)
 	minValue = tonumber(minValue) or 0
 	local obj = self._tab:Slider(name, minValue, maxValue, minValue, callback, { Tooltip = tipFor(name, info) })
 	return {
-		UpdateSlider = function(_, _, value)
-			obj:Set(value)
+		UpdateSlider = function(_, newText, value)
+			if newText ~= nil then
+				obj:SetText(newText)
+			end
+			if value ~= nil then
+				obj:Set(value, true)
+			end
 		end,
 	}
 end
@@ -1706,6 +2255,18 @@ end
 
 function Section:NewTextBox(name, info, callback)
 	self._tab:Input(name, "type here", callback, { Tooltip = tipFor(name, info) })
+end
+
+function Section:NewKeybind(name, info, key, callback)
+	self._tab:Keybind(name, key, callback, { Tooltip = tipFor(name, info) })
+end
+
+function Section:NewDropdown(name, info, list, callback)
+	return self._tab:Dropdown(name, list, callback, { Tooltip = tipFor(name, info) })
+end
+
+function Section:NewColorPicker(name, info, default, callback)
+	self._tab:ColorPicker(name, default, callback, { Tooltip = tipFor(name, info) })
 end
 
 return Library
