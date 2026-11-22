@@ -344,7 +344,7 @@ local PROP_TYPES = {
 	TextTransparency = "number", BorderSizePixel = "number", ZIndex = "number", LayoutOrder = "number",
 	Visible = "boolean", ClipsDescendants = "boolean", AutoButtonColor = "boolean", TextWrapped = "boolean",
 	ClearTextOnFocus = "boolean", ResetOnSpawn = "boolean", IgnoreGuiInset = "boolean",
-	Text = "string", PlaceholderText = "string", Name = "string",
+	Image = "string", ImageTransparency = "number", Text = "string", PlaceholderText = "string", Name = "string",
 	TextSize = "number", Scale = "number", Thickness = "number", ScrollBarThickness = "number",
 	DisplayOrder = "number", Rotation = "number",
 	AbsolutePosition = "Vector2", AbsoluteSize = "Vector2", ViewportSize = "Vector2",
@@ -421,6 +421,15 @@ local CLASSES = {
 		defaults = function()
 			local d = textDefaults(guiDefaults())
 			d.AutoButtonColor = true
+			return d
+		end,
+	},
+	ImageLabel = {
+		props = set(join(GUI_PROPS, { "Image", "ImageTransparency", "ImageColor3", "ScaleType" })), signals = set(GUI_SIGNALS),
+		defaults = function()
+			local d = guiDefaults()
+			d.Image = ""
+			d.ImageTransparency = 0
 			return d
 		end,
 	},

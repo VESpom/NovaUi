@@ -1197,6 +1197,222 @@ test("login card X button on an unlocked (no key) window just closes it", functi
 end)
 
 ----------------------------------------------------------------------
+-- 6c. Custom login image
+----------------------------------------------------------------------
+local PNG = "\137PNG\r\n\26\n" .. string.rep("x", 40)
+local JPG = "\255\216\255\224" .. string.rep("y", 40)
+
+-- Fake executor file API. Returns a table recording what happened.
+local function fakeExecutor(data, opts)
+	opts = opts or {}
+	local rec = { files = {}, gets = 0, folders = {}, urls = {} }
+	_G.writefile = function(path, content) rec.files[path] = content end
+	_G.isfile = function(path) return rec.files[path] ~= nil end
+	_G.makefolder = function(path) table.insert(rec.folders, path) end
+	_G.getcustomasset = function(path) return "rbxasset://custom/" .. path end
+	M.game.HttpGet = function(_, url)
+		rec.gets = rec.gets + 1
+		table.insert(rec.urls, url)
+		if opts.wait then
+			task.wait(opts.wait)
+		end
+		if opts.fail then
+			error("HTTP 404")
+		end
+		return data
+	end
+	return rec
+end
+local function clearExecutor()
+	_G.writefile, _G.isfile, _G.makefolder, _G.getcustomasset, _G.getsynasset = nil, nil, nil, nil, nil
+	_G.request, _G.http_request = nil, nil
+end
+local function warned(part)
+	for _, w in ipairs(M.warnings) do
+		if string.find(w, part, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+local function imageOf(win)
+	return findByName(win.Gui, "LogoImage")
+end
+
+test("image: asset id (number, digits string, rbxassetid://) shows at once", function()
+	for _, src in ipairs({ 12345, "12345", "rbxassetid://12345" }) do
+		local Lib = loadLib()
+		local win = Lib.CreateLib("Hub", "DarkTheme", { Image = src })
+		local img = imageOf(win)
+		check(img ~= nil, tostring(src) .. ": image label exists")
+		eq(img.Image, "rbxassetid://12345", tostring(src) .. ": asset")
+		eq(img.ImageTransparency, 1, "starts transparent (fades in)")
+		M.advance(0.5)
+		eq(img.ImageTransparency, 0, "faded in")
+		eq(findByName(win.Gui, "LogoText").TextTransparency, 1, "letter faded out")
+	end
+end)
+
+test("image: no Image option builds no image label and keeps the letter", function()
+	local Lib = loadLib()
+	local win = Lib.CreateLib("Hub", "DarkTheme")
+	check(imageOf(win) == nil, "no image label")
+	eq(findByName(win.Gui, "LogoText").TextTransparency, 0, "letter visible")
+end)
+
+test("image: https link is downloaded, saved under a hashed name, and shown", function()
+	local Lib = loadLib()
+	local rec = fakeExecutor(PNG)
+	local url = "https://cdn.discordapp.com/attachments/1/2/logo.png?ex=abc&is=def"
+	local win = Lib.CreateLib("Hub", "DarkTheme", { Image = url })
+	M.advance(0.5)
+	eq(rec.gets, 1, "downloaded once")
+	eq(rec.urls[1], url, "right url")
+	local names = {}
+	for path, content in pairs(rec.files) do
+		table.insert(names, path)
+		eq(content, PNG, "saved the exact bytes")
+	end
+	eq(#names, 1, "one file")
+	check(string.match(names[1], "^NovaUI/img_%x+%.png$") ~= nil, "hash-based name: " .. tostring(names[1]))
+	eq(imageOf(win).Image, "rbxasset://custom/" .. names[1], "shown via getcustomasset")
+	eq(imageOf(win).ImageTransparency, 0, "visible")
+	eq(rec.folders[1], "NovaUI", "folder created")
+	clearExecutor()
+end)
+
+test("image: second window with the same link uses the cache (no download)", function()
+	local Lib = loadLib()
+	local rec = fakeExecutor(PNG)
+	local url = "https://example.com/logo.png"
+	Lib.CreateLib("Hub", "DarkTheme", { Image = url })
+	M.advance(0.5)
+	local win2 = Lib.CreateLib("Hub", "DarkTheme", { Image = url })
+	M.advance(0.5)
+	eq(rec.gets, 1, "downloaded only once")
+	check(string.find(imageOf(win2).Image, "NovaUI/img_", 1, true) ~= nil, "second window shows it too")
+	clearExecutor()
+end)
+
+test("image: JPEG is accepted and saved as .jpg", function()
+	local Lib = loadLib()
+	local rec = fakeExecutor(JPG)
+	Lib.CreateLib("Hub", "DarkTheme", { Image = "https://example.com/a.jpg" })
+	M.advance(0.5)
+	local ok = false
+	for path in pairs(rec.files) do
+		ok = string.match(path, "%.jpg$") ~= nil
+	end
+	check(ok, "saved as .jpg")
+	clearExecutor()
+end)
+
+test("image: executor without file functions falls back to the letter and says why", function()
+	local Lib = loadLib()
+	clearExecutor()
+	M.game.HttpGet = function() error("must not be called") end
+	local win = Lib.CreateLib("Hub", "DarkTheme", { Image = "https://example.com/a.png" })
+	M.advance(0.5)
+	eq(imageOf(win).Image, "", "no image set")
+	eq(findByName(win.Gui, "LogoText").TextTransparency, 0, "letter stays")
+	check(warned("can't load images from links"), "reason warned")
+end)
+
+test("image: webp / gif / html are rejected (magic bytes), letter stays", function()
+	for label, data in pairs({ webp = "RIFF\0\0\0\0WEBPVP8 ", gif = "GIF89a" .. string.rep("z", 20), html = "<html><body>404</body></html>" }) do
+		local Lib = loadLib()
+		local rec = fakeExecutor(data)
+		local win = Lib.CreateLib("Hub", "DarkTheme", { Image = "https://example.com/x." .. label })
+		M.advance(0.5)
+		eq(imageOf(win).Image, "", label .. ": no image")
+		check(next(rec.files) == nil, label .. ": nothing written to disk")
+		check(warned("not a PNG or JPEG"), label .. ": reason warned")
+		clearExecutor()
+	end
+end)
+
+test("image: oversized download is rejected before touching disk", function()
+	local Lib = loadLib()
+	local rec = fakeExecutor("\137PNG\r\n\26\n" .. string.rep("a", 8 * 1024 * 1024))
+	local win = Lib.CreateLib("Hub", "DarkTheme", { Image = "https://example.com/huge.png" })
+	M.advance(0.5)
+	check(next(rec.files) == nil, "nothing written")
+	check(warned("too large"), "reason warned")
+	eq(imageOf(win).Image, "", "no image")
+	clearExecutor()
+end)
+
+test("image: failing HttpGet falls back to request(); both failing keeps the letter", function()
+	local Lib = loadLib()
+	local rec = fakeExecutor(nil, { fail = true })
+	_G.request = function(req)
+		return { StatusCode = 200, Body = PNG, Url = req.Url }
+	end
+	local win = Lib.CreateLib("Hub", "DarkTheme", { Image = "https://example.com/a.png" })
+	M.advance(0.5)
+	check(string.find(imageOf(win).Image, "NovaUI/img_", 1, true) ~= nil, "request() fallback worked")
+	clearExecutor()
+	local Lib2 = loadLib()
+	fakeExecutor(nil, { fail = true })
+	local win2 = Lib2.CreateLib("Hub", "DarkTheme", { Image = "https://example.com/b.png" })
+	M.advance(0.5)
+	eq(imageOf(win2).Image, "", "no image")
+	check(warned("download failed"), "download failure reported")
+	clearExecutor()
+end)
+
+test("image: unsafe or invalid sources are never fetched", function()
+	for _, bad in ipairs({
+		"file:///etc/passwd", "javascript:alert(1)", "ftp://example.com/a.png", "https://exa mple.com/a b.png",
+		"data:image/png;base64,AAAA", "", {}, -5, 1.5, 0, true, "https://example.com/\"onerror=1",
+		"rbxasset://../../secret.png", "../../etc/passwd",
+	}) do
+		local Lib = loadLib()
+		local rec = fakeExecutor(PNG)
+		local win = Lib.CreateLib("Hub", "DarkTheme", { Image = bad })
+		M.advance(0.5)
+		eq(rec.gets, 0, "no request for " .. tostring(bad))
+		check(next(rec.files) == nil, "no file for " .. tostring(bad))
+		eq(imageOf(win).Image, "", "no image for " .. tostring(bad))
+		clearExecutor()
+	end
+end)
+
+test("image: file name never contains anything from the link (path traversal)", function()
+	local Lib = loadLib()
+	local rec = fakeExecutor(PNG)
+	Lib.CreateLib("Hub", "DarkTheme", { Image = "https://x.com/../../evil/..%2f..%2fpwn.png" })
+	M.advance(0.5)
+	for path in pairs(rec.files) do
+		check(string.match(path, "^NovaUI/img_%x+%.png$") ~= nil and not string.find(path, "..", 1, true), "safe path: " .. path)
+	end
+	check(next(rec.files) ~= nil, "it still saved something")
+	clearExecutor()
+end)
+
+test("image: destroying the window before a slow download ends is clean", function()
+	local Lib = loadLib()
+	fakeExecutor(PNG, { wait = 2 })
+	local win = Lib.CreateLib("Hub", "DarkTheme", { Image = "https://example.com/slow.png" })
+	M.advance(0.5)
+	local img = imageOf(win)
+	win:Destroy()
+	M.advance(5)
+	check(win._destroyed, "destroyed without errors")
+	eq(img.Image, "", "the late download does not touch the destroyed window")
+	clearExecutor()
+end)
+
+test("image: works on the key screen too, and Logo is an alias", function()
+	local Lib = loadLib()
+	local r = startKey(Lib, { Key = "k" }, { Logo = 777 })
+	M.advance(0.5)
+	local gui = currentGui()
+	eq(findByName(gui, "LogoImage").Image, "rbxassetid://777", "alias works with a key system")
+	check(not r.done, "still locked")
+end)
+
+----------------------------------------------------------------------
 -- 7. Regression: the Kavo-style example and native API from the repo
 ----------------------------------------------------------------------
 local function runExample(file, expectReturn)

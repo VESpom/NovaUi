@@ -4,6 +4,7 @@ local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/VESpo
 -- CreateLib WAITS here until a valid key is entered, so nothing below runs before that.
 -- Leave KeySystem out and the UI opens right after Enter, like before.
 local Window = Library.CreateLib("My Hub", "DarkTheme", {
+	-- Image = "https://raw.githubusercontent.com/YOU/REPO/main/logo.png", -- custom logo on the login card (or an asset id)
 	KeySystem = {
 		Key = "hello123", -- one key (or Keys = { "a", "b" })
 		-- KeyHash = Library.HashKey("hello123"), -- store only a salted hash in your script instead of the plain key

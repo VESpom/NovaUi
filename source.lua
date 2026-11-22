@@ -15,6 +15,10 @@
 	          Window:SelectTab("Main")     -- jump to a tab from any button
 	          Window:Destroy()
 
+	Login image (optional): { Image = 1234567890 } or { Image = "rbxassetid://1234567890" } or { Image = "https://host/logo.png" }
+	          Links need an executor with writefile + getcustomasset; PNG or JPEG only, up to 8 MB. If it can't load,
+	          the letter logo stays and a warning is printed.
+
 	Key system (optional - leave it out and the UI just opens after Enter):
 	          NovaUI.CreateLib("Hub", "DarkTheme", { KeySystem = { Key = "hello123" } })
 	          KeySystem fields: Key / Keys (plain text, hashed on load), KeyHash / KeyHashes (from NovaUI.HashKey),
@@ -1069,6 +1073,132 @@ local function trimText(s)
 	return (string.match(tostring(s), "^%s*(.-)%s*$"))
 end
 
+----------------------------------------------------------------------
+-- Custom login image: Image = 123456 | "rbxassetid://123" | "https://host/pic.png"
+-- Roblox cannot show a web link directly, so links are downloaded by the executor,
+-- saved under NovaUI/ and loaded with getcustomasset. Anything that fails falls back
+-- to the letter logo (never an error).
+----------------------------------------------------------------------
+
+local MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+local function envFn(getter)
+	local ok, fn = pcall(getter)
+	if ok and type(fn) == "function" then
+		return fn
+	end
+	return nil
+end
+
+local function imageKind(data)
+	if string.sub(data, 1, 8) == "\137PNG\r\n\26\n" then
+		return "png"
+	end
+	if string.sub(data, 1, 3) == "\255\216\255" then
+		return "jpg"
+	end
+	return nil
+end
+
+local function downloadImage(url)
+	local ok, body = pcall(function()
+		return game:HttpGet(url)
+	end)
+	if ok and type(body) == "string" and body ~= "" then
+		return body
+	end
+	local request = envFn(function()
+		return request
+	end) or envFn(function()
+		return http_request
+	end)
+	if request then
+		local ok2, res = pcall(request, { Url = url, Method = "GET" })
+		if ok2 and type(res) == "table" and res.StatusCode == 200 and type(res.Body) == "string" then
+			return res.Body
+		end
+	end
+	return nil
+end
+
+-- done(asset) on success, done(nil, reason) otherwise. May answer later (downloads run in a thread).
+local function resolveImage(src, done)
+	if type(src) == "number" then
+		if src > 0 and src == math.floor(src) then
+			return done("rbxassetid://" .. string.format("%d", src))
+		end
+		return done(nil, "invalid asset id")
+	end
+	if type(src) ~= "string" or src == "" then
+		return done(nil, "Image must be an asset id or an https link")
+	end
+	if string.match(src, "^%d+$") then
+		return done("rbxassetid://" .. src)
+	end
+	if string.match(src, "^rbxassetid://%d+$") then
+		return done(src)
+	end
+	if not string.match(src, "^https?://[%w%-%._~:/%?#@!$&'()*+,;=%%]+$") or #src > 2000 then
+		return done(nil, "unsupported image source (use an asset id or an http/https link)")
+	end
+	local writeFile = envFn(function()
+		return writefile
+	end)
+	local getAsset = envFn(function()
+		return getcustomasset
+	end) or envFn(function()
+		return getsynasset
+	end)
+	if not writeFile or not getAsset then
+		return done(nil, "this executor can't load images from links (needs writefile + getcustomasset); use an rbxassetid instead")
+	end
+	local isFile = envFn(function()
+		return isfile
+	end)
+	local makeFolder = envFn(function()
+		return makefolder
+	end)
+	-- the file name comes from a hash, never from the link
+	local base = "NovaUI/img_" .. string.sub(sha256(src), 1, 24)
+	task.spawn(function()
+		local path = nil
+		if isFile then
+			for _, ext in ipairs({ "png", "jpg" }) do
+				local ok, exists = pcall(isFile, base .. "." .. ext)
+				if ok and exists then
+					path = base .. "." .. ext
+				end
+			end
+		end
+		if not path then
+			local data = downloadImage(src)
+			if not data then
+				return done(nil, "download failed")
+			end
+			if #data > MAX_IMAGE_BYTES then
+				return done(nil, "image too large (max 8 MB)")
+			end
+			local kind = imageKind(data)
+			if not kind then
+				return done(nil, "not a PNG or JPEG (Roblox cannot show webp/gif)")
+			end
+			if makeFolder then
+				pcall(makeFolder, "NovaUI")
+			end
+			path = base .. "." .. kind
+			if not pcall(writeFile, path, data) then
+				return done(nil, "could not save the image")
+			end
+		end
+		local ok, asset = pcall(getAsset, path)
+		if ok and type(asset) == "string" and asset ~= "" then
+			done(asset)
+		else
+			done(nil, "could not load the image")
+		end
+	end)
+end
+
 -- Filled accent button with a bold white label. The gradient lives on its own frame
 -- (a UIGradient on the button itself would tint the label too).
 -- Returns the clickable TextButton and its holder frame.
@@ -1254,7 +1384,7 @@ function Library:_buildLoader(options, keyCfg, startAtKey)
 		stroke(theme.AccentLight, 0.4, 2),
 		create("UIGradient", { Rotation = 90, Color = ColorSequence.new(logoFill, mix(logoFill, BLACK, 0.25)) }),
 	})
-	textLabel({
+	local logoLetter = textLabel({
 		Name = "LogoText",
 		AnchorPoint = Vector2.new(0.5, 0),
 		Position = UDim2.new(0.5, 0, 0, 26),
@@ -1267,6 +1397,33 @@ function Library:_buildLoader(options, keyCfg, startAtKey)
 		ZIndex = 2,
 		Parent = card,
 	})
+	if options.Image ~= nil or options.Logo ~= nil then
+		local logoImage = create("ImageLabel", {
+			Name = "LogoImage",
+			AnchorPoint = Vector2.new(0.5, 0),
+			Position = UDim2.new(0.5, 0, 0, 26),
+			Size = UDim2.fromOffset(56, 56),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Image = "",
+			ImageTransparency = 1,
+			ScaleType = Enum.ScaleType.Crop,
+			ZIndex = 3,
+			Parent = card,
+		}, { corner(16) })
+		resolveImage(options.Image ~= nil and options.Image or options.Logo, function(asset, why)
+			if self._destroyed then
+				return
+			end
+			if not asset then
+				warn("[NovaUI] Image: " .. tostring(why))
+				return
+			end
+			logoImage.Image = asset
+			tween(logoImage, 0.3, { ImageTransparency = 0 })
+			tween(logoLetter, 0.3, { TextTransparency = 1 })
+		end)
+	end
 	textLabel({
 		Name = "Title",
 		Position = UDim2.fromOffset(0, 92),

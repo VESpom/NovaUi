@@ -41,6 +41,26 @@ No `KeySystem` option = no key screen, the UI opens right after **Enter**. See `
 What it protects, honestly: `CreateLib` blocks until the key is valid, element callbacks are gated, the window cannot be revealed by RightShift/`ToggleUI`, a wrong or misconfigured setup **stays locked**, and the key is never stored in plain text on the UI side.
 What it can't: anyone who can *edit the script they run* can delete the key check, because it runs on their machine. For real protection, keep the valuable code on your server and return it from `Validate` as the payload.
 
+## Custom login image
+
+```lua
+local Window = Library.CreateLib("My Hub", "DarkTheme", {
+	Image = "https://raw.githubusercontent.com/YOU/REPO/main/logo.png", -- or 1234567890 / "rbxassetid://1234567890"
+})
+```
+
+It replaces the letter logo on the login card (the `Logo` option does the same). Three ways to give it:
+
+| Source | Needs | Notes |
+|---|---|---|
+| Roblox asset id (`123`, `"rbxassetid://123"`) | nothing | Best option: works everywhere, shows instantly. Upload the image to Roblox first. |
+| `https://` link | executor with `writefile` + `getcustomasset` | Roblox can't show a web link directly, so NovaUI downloads it, saves it in `NovaUI/` and loads that copy. Cached, so it downloads once. |
+| none | | Letter logo, as before. |
+
+Limits: PNG or JPEG only (no webp/gif), up to 8 MB. If anything fails (old executor, bad link, wrong format) the letter logo stays and a warning is printed; it never errors.
+
+Discord: a Discord image works if it is a direct `.png`/`.jpg` link, but Discord attachment links carry an expiry (`?ex=...`) and stop working later. For a permanent logo, put the file in your GitHub repo and use its `raw.githubusercontent.com` link, or upload it to Roblox and use the asset id.
+
 ## Window and login
 
 - The login card is draggable (grab anywhere except the buttons and key box); the window opens where you leave it.
