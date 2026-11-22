@@ -14,6 +14,14 @@
 	Extras:   Window:Notify("Title", "Message", 4)
 	          Window:SelectTab("Main")     -- jump to a tab from any button
 	          Window:Destroy()
+
+	Key system (optional - leave it out and the UI just opens after Enter):
+	          NovaUI.CreateLib("Hub", "DarkTheme", { KeySystem = { Key = "hello123" } })
+	          KeySystem fields: Key / Keys (plain text, hashed on load), KeyHash / KeyHashes (from NovaUI.HashKey),
+	          Validate(key) -> true [, payload] (your own server check), Note, Link, MaxAttempts, Timeout.
+	          CreateLib/new WAIT until a valid key is entered, so the rest of your script does not run before that.
+	          A client-side check can always be edited out by whoever runs the script; for real protection keep
+	          your code on your server and return it from Validate (it comes back as the 2nd result of CreateLib).
 ]==]
 
 local Players = game:GetService("Players")
@@ -135,10 +143,24 @@ local FONT_BOLD = Enum.Font.GothamBold
 local TOPBAR_H = 44
 local SIDEBAR_W = 150
 
+-- sidebar tab geometry (the sliding highlight is positioned from these)
+local TAB_H = 36
+local TAB_GAP = 4
+local TAB_TOP = 10
+
+-- Enter screen
+local CARD_W = 360
+local CARD_H = { Welcome = 262, Key = 346, Load = 262 }
+local STAGE_X, STAGE_Y = 28, 154
+local STAGE_W = CARD_W - 56
+local COLOR_BAD = Color3.fromRGB(255, 95, 110)
+local COLOR_GOOD = Color3.fromRGB(80, 220, 140)
+
 local STYLE_QUAD = Enum.EasingStyle.Quad
 local STYLE_QUART = Enum.EasingStyle.Quart
 local STYLE_BACK = Enum.EasingStyle.Back
 local DIR_OUT = Enum.EasingDirection.Out
+local DIR_IN = Enum.EasingDirection.In
 local DIR_INOUT = Enum.EasingDirection.InOut
 
 ----------------------------------------------------------------------
@@ -272,6 +294,289 @@ local function textLabel(props, children)
 		base[k] = v
 	end
 	return create("TextLabel", base, children)
+end
+
+----------------------------------------------------------------------
+-- Key system core: salted + stretched SHA-256, and the unlock gate.
+-- Nothing here is exposed as a field on the window table, so a script
+-- that pokes window._something cannot flip the gate; only the key UI's
+-- closures call unlockWindow().
+----------------------------------------------------------------------
+
+local band, bor, bxor, bnot = bit32.band, bit32.bor, bit32.bxor, bit32.bnot
+local rshift, rrotate = bit32.rshift, bit32.rrotate
+local MOD32 = 4294967296
+
+local SHA_K = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+}
+local shaW = {}
+
+local function be32(n)
+	return string.char(band(rshift(n, 24), 255), band(rshift(n, 16), 255), band(rshift(n, 8), 255), band(n, 255))
+end
+
+-- Plain SHA-256 (FIPS 180-4), returns lowercase hex.
+local function sha256(msg)
+	local len = #msg
+	local bitLen = len * 8
+	msg = msg .. "\128" .. string.rep("\0", (55 - len) % 64)
+		.. be32(math.floor(bitLen / MOD32)) .. be32(bitLen % MOD32)
+	local h0, h1, h2, h3 = 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a
+	local h4, h5, h6, h7 = 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+	local w = shaW
+	for chunk = 1, #msg, 64 do
+		for i = 1, 16 do
+			local p = chunk + (i - 1) * 4
+			local b1, b2, b3, b4 = string.byte(msg, p, p + 3)
+			w[i] = b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
+		end
+		for i = 17, 64 do
+			local w15, w2 = w[i - 15], w[i - 2]
+			local s0 = bxor(rrotate(w15, 7), rrotate(w15, 18), rshift(w15, 3))
+			local s1 = bxor(rrotate(w2, 17), rrotate(w2, 19), rshift(w2, 10))
+			w[i] = (w[i - 16] + s0 + w[i - 7] + s1) % MOD32
+		end
+		local a, b, c, d, e, f, g, h = h0, h1, h2, h3, h4, h5, h6, h7
+		for i = 1, 64 do
+			local S1 = bxor(rrotate(e, 6), rrotate(e, 11), rrotate(e, 25))
+			local ch = bxor(band(e, f), band(bnot(e), g))
+			local t1 = (h + S1 + ch + SHA_K[i] + w[i]) % MOD32
+			local S0 = bxor(rrotate(a, 2), rrotate(a, 13), rrotate(a, 22))
+			local maj = bxor(band(a, b), band(a, c), band(b, c))
+			local t2 = (S0 + maj) % MOD32
+			h = g
+			g = f
+			f = e
+			e = (d + t1) % MOD32
+			d = c
+			c = b
+			b = a
+			a = (t1 + t2) % MOD32
+		end
+		h0 = (h0 + a) % MOD32
+		h1 = (h1 + b) % MOD32
+		h2 = (h2 + c) % MOD32
+		h3 = (h3 + d) % MOD32
+		h4 = (h4 + e) % MOD32
+		h5 = (h5 + f) % MOD32
+		h6 = (h6 + g) % MOD32
+		h7 = (h7 + h) % MOD32
+	end
+	return string.format("%08x%08x%08x%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4, h5, h6, h7)
+end
+
+-- Key stretching: every guess costs `rounds` hashes, so offline guessing is slow
+-- and a plain-text key never has to sit in the script.
+local KDF_ROUNDS = 1000
+local MAX_ROUNDS = 50000
+local MAX_KEY_LEN = 256
+
+local function deriveKey(key, salt, rounds)
+	local h = sha256(salt .. "\0" .. key)
+	for _ = 2, rounds do
+		h = sha256(h .. salt .. key)
+	end
+	return h
+end
+
+-- "nv1$<rounds>$<salt hex>$<hash hex>"
+local function parseKeyHash(text)
+	if type(text) ~= "string" then
+		return nil
+	end
+	local rounds, salt, hex = string.match(text, "^nv1%$(%d+)%$(%x+)%$(%x+)$")
+	rounds = tonumber(rounds)
+	if not rounds or rounds < 1 or rounds > MAX_ROUNDS or #hex ~= 64 or #salt < 8 or #salt > 64 then
+		return nil
+	end
+	return { rounds = rounds, salt = salt, hex = string.lower(hex) }
+end
+
+-- Library.HashKey("hello123") -> the string to store as KeyHash.
+local function hashKey(key, salt, rounds)
+	key = tostring(key)
+	if salt == nil then
+		local parts = {}
+		for i = 1, 4 do
+			parts[i] = string.format("%04x", math.random(0, 65535))
+		end
+		salt = table.concat(parts)
+	end
+	rounds = rounds or KDF_ROUNDS
+	return "nv1$" .. rounds .. "$" .. salt .. "$" .. deriveKey(key, salt, rounds)
+end
+
+-- Compares two strings without bailing out at the first different character.
+local function constantTimeEquals(a, b)
+	if #a ~= #b then
+		return false
+	end
+	local diff = 0
+	for i = 1, #a do
+		diff = bor(diff, bxor(string.byte(a, i), string.byte(b, i)))
+	end
+	return diff == 0
+end
+
+local function matchesAnyHash(entries, input)
+	local matched = false
+	for _, entry in ipairs(entries) do -- no early exit: time does not reveal which entry matched
+		if constantTimeEquals(deriveKey(input, entry.salt, entry.rounds), entry.hex) then
+			matched = true
+		end
+	end
+	return matched
+end
+
+-- Turns the user's KeySystem table into a checked config. Misconfiguration fails CLOSED:
+-- the window stays locked and says so, it never opens.
+local function prepareKeySystem(cfg)
+	local out = { entries = {}, validate = nil, maxAttempts = 5, timeout = 15 }
+	if type(cfg) ~= "table" then
+		warn("[NovaUI] KeySystem must be a table like { Key = \"...\" }; the window will stay locked")
+		out.misconfigured = true
+		return out
+	end
+	local function each(value, fn)
+		if type(value) == "table" then
+			for _, v in ipairs(value) do
+				fn(v)
+			end
+		elseif value ~= nil then
+			fn(value)
+		end
+	end
+	each(cfg.Key, function(k)
+		if type(k) == "string" and k ~= "" and #k <= MAX_KEY_LEN then
+			table.insert(out.entries, parseKeyHash(hashKey(k)))
+		else
+			warn("[NovaUI] KeySystem.Key must be a non-empty string up to " .. MAX_KEY_LEN .. " characters; ignored")
+		end
+	end)
+	each(cfg.Keys, function(k)
+		if type(k) == "string" and k ~= "" and #k <= MAX_KEY_LEN then
+			table.insert(out.entries, parseKeyHash(hashKey(k)))
+		else
+			warn("[NovaUI] KeySystem.Keys entries must be non-empty strings; ignored one")
+		end
+	end)
+	local function addHash(h)
+		local parsed = parseKeyHash(h)
+		if parsed then
+			table.insert(out.entries, parsed)
+		else
+			warn("[NovaUI] KeySystem.KeyHash is not a valid NovaUI.HashKey string; ignored")
+		end
+	end
+	each(cfg.KeyHash, addHash)
+	each(cfg.KeyHashes, addHash)
+	if type(cfg.Validate) == "function" then
+		out.validate = cfg.Validate
+	elseif cfg.Validate ~= nil then
+		warn("[NovaUI] KeySystem.Validate must be a function; ignored")
+	end
+	if #out.entries == 0 and not out.validate then
+		warn("[NovaUI] KeySystem has no usable Key, KeyHash or Validate; the window will stay locked")
+		out.misconfigured = true
+	end
+	out.maxAttempts = clamp(math.floor(tonumber(cfg.MaxAttempts) or 5), 1, 20)
+	out.timeout = clamp(tonumber(cfg.Timeout) or 15, 2, 120)
+	out.note = type(cfg.Note) == "string" and cfg.Note or nil
+	out.link = type(cfg.Link) == "string" and cfg.Link or nil
+	out.linkText = type(cfg.LinkText) == "string" and cfg.LinkText or "Get Key"
+	return out
+end
+
+-- Returns ok, payload. Validate must return exactly `true` (a truthy string does not count).
+local function checkKey(cfg, input)
+	if #input > MAX_KEY_LEN then
+		return false
+	end
+	if #cfg.entries > 0 and matchesAnyHash(cfg.entries, input) then
+		return true
+	end
+	if cfg.validate then
+		local ok, result, payload = pcall(cfg.validate, input)
+		if not ok then
+			warn("[NovaUI] KeySystem.Validate error: " .. tostring(result))
+		elseif result == true then
+			return true, payload
+		end
+	end
+	return false
+end
+
+-- Unlock state lives here, keyed by window, weakly, out of reach of the window table.
+local gate = setmetatable({}, { __mode = "k" })
+local payloads = setmetatable({}, { __mode = "k" })
+-- Open windows live here, not on the Library table, so nothing can grab a window that is still locked.
+local liveWindows = {}
+
+local function isUnlocked(win)
+	return gate[win] == true
+end
+
+local function unlockWindow(win, payload)
+	gate[win] = true
+	payloads[win] = payload
+end
+
+-- Every user callback goes through here, so nothing runs while a window is locked.
+local function runGated(win, fn, ...)
+	if gate[win] ~= true then
+		return
+	end
+	safe(fn, ...)
+end
+
+-- Text/colour helpers for the Enter screen.
+local function linearChannel(c)
+	if c <= 0.03928 then
+		return c / 12.92
+	end
+	return ((c + 0.055) / 1.055) ^ 2.4
+end
+
+local function relativeLuminance(c)
+	return 0.2126 * linearChannel(c.R) + 0.7152 * linearChannel(c.G) + 0.0722 * linearChannel(c.B)
+end
+
+local function contrastRatio(a, b)
+	local l1, l2 = relativeLuminance(a), relativeLuminance(b)
+	if l1 < l2 then
+		l1, l2 = l2, l1
+	end
+	return (l1 + 0.05) / (l2 + 0.05)
+end
+
+-- Accent darkened just enough that white text on it reads clearly (WCAG AA, 4.5:1).
+local function readableFill(accent)
+	local t = 0.18
+	local c = mix(accent, BLACK, t)
+	while contrastRatio(WHITE, c) < 4.5 and t < 0.9 do
+		t = t + 0.04
+		c = mix(accent, BLACK, t)
+	end
+	return c
+end
+
+-- Pushes `color` towards white (dark bg) or black (light bg) until it reaches `ratio`:1 contrast.
+local function legible(color, bg, ratio)
+	local target = luminance(bg) > 0.5 and BLACK or WHITE
+	local t, c = 0, color
+	while contrastRatio(c, bg) < ratio and t < 1 do
+		t = t + 0.05
+		c = mix(color, target, t)
+	end
+	return c
 end
 
 ----------------------------------------------------------------------
@@ -597,6 +902,10 @@ function Library:_updateScale()
 	local vp = viewport()
 	local s = math.min(1, (vp.X - 24) / self._size.X, (vp.Y - 24) / self._size.Y)
 	self._uiScale.Scale = math.max(s, 0.4)
+	if self._loaderScale then
+		local ls = math.min(1, (vp.X - 24) / CARD_W, (vp.Y - 24) / CARD_H.Key)
+		self._loaderScale.Scale = math.max(ls, 0.5)
+	end
 end
 
 function Library:_showTip(target, title, body)
@@ -641,13 +950,14 @@ function Library:_attachTip(target, tip)
 	end)
 end
 
-function Library:_makeDraggable(handle, target)
+-- `blocker(input)` (optional) returns true for presses that must NOT start a drag, e.g. on a button.
+function Library:_makeDraggable(handle, target, blocker)
 	local dragging = false
 	local dragInput = nil
 	local startX, startY, startPos = 0, 0, nil
 
 	self:_connect(handle.InputBegan, function(input)
-		if isPress(input) then
+		if isPress(input) and not (blocker and blocker(input)) then
 			dragging = true
 			dragInput = input
 			startX, startY = input.Position.X, input.Position.Y
@@ -682,7 +992,7 @@ function Library:_makeDraggable(handle, target)
 end
 
 function Library:_expand()
-	if self._destroyed then
+	if self._destroyed or not isUnlocked(self) then
 		return
 	end
 	local main = self._main
@@ -694,7 +1004,8 @@ function Library:_expand()
 	tween(main, 0.45, { Size = UDim2.fromOffset(self._size.X, height) }, STYLE_BACK)
 end
 
-function Library:_collapse()
+-- Reverse of _expand: the window folds down to a title bar, then flattens away.
+function Library:_collapse(onDone)
 	if self._destroyed then
 		return
 	end
@@ -702,16 +1013,28 @@ function Library:_collapse()
 	local token = self._token
 	self.Visible = false
 	self:_hideTip()
-	tween(self._main, 0.2, { Size = UDim2.fromOffset(self._size.X * 0.7, 0) })
-	task.delay(0.2, function()
-		if not self._destroyed and self._token == token then
-			self._main.Visible = false
+	local main = self._main
+	local w = self._size.X * 0.7
+	tween(main, 0.26, { Size = UDim2.fromOffset(w, TOPBAR_H) }, STYLE_QUART, DIR_IN)
+	task.delay(0.26, function()
+		if self._destroyed or self._token ~= token then
+			return
 		end
+		tween(main, 0.14, { Size = UDim2.fromOffset(w * 0.8, 0) }, STYLE_QUART)
+		task.delay(0.14, function()
+			if self._destroyed or self._token ~= token then
+				return
+			end
+			main.Visible = false
+			if onDone then
+				onDone()
+			end
+		end)
 	end)
 end
 
 function Library:SetVisible(visible)
-	if self._destroyed or not self._opened then
+	if self._destroyed or not self._opened or self._closing then
 		return
 	end
 	if visible == self.Visible then
@@ -738,61 +1061,333 @@ function Library:SetMinimized(minimized)
 	self._minButton.Text = self.Minimized and "+" or "–"
 end
 
-function Library:_buildLoader(options)
+----------------------------------------------------------------------
+-- Enter screen (draggable card): Enter -> [key entry] -> loading -> window
+----------------------------------------------------------------------
+
+local function trimText(s)
+	return (string.match(tostring(s), "^%s*(.-)%s*$"))
+end
+
+-- Filled accent button with a bold white label. The gradient lives on its own frame
+-- (a UIGradient on the button itself would tint the label too).
+-- Returns the clickable TextButton and its holder frame.
+local function primaryButton(win, parent, text, x, y, w, h)
+	local theme = win.Theme
+	local top = readableFill(theme.Accent)
+	local holder = create("Frame", {
+		Name = "Primary",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(x + w / 2, y + h / 2),
+		Size = UDim2.fromOffset(w, h),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = parent,
+	})
+	local scale = create("UIScale", { Scale = 1, Parent = holder })
+	local fill = create("Frame", {
+		Name = "Fill",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		Parent = holder,
+	}, {
+		corner(10),
+		create("UIGradient", { Rotation = 90, Color = ColorSequence.new(top, mix(top, BLACK, 0.25)) }),
+	})
+	local ring = create("UIStroke", {
+		Color = theme.AccentLight,
+		Transparency = 0.55,
+		Thickness = 2,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = fill,
+	})
+	local btn = create("TextButton", {
+		Name = "Hit",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		BorderSizePixel = 0,
+		Font = FONT_BOLD,
+		TextSize = 16,
+		TextColor3 = WHITE,
+		Text = text,
+		ZIndex = 2,
+		Parent = holder,
+	})
+	win:_connect(btn.MouseEnter, function()
+		tween(scale, 0.15, { Scale = 1.03 })
+		tween(ring, 0.15, { Transparency = 0.1 })
+	end)
+	win:_connect(btn.MouseLeave, function()
+		tween(scale, 0.15, { Scale = 1 })
+		tween(ring, 0.15, { Transparency = 0.55 })
+	end)
+	win:_connect(btn.MouseButton1Down, function()
+		tween(scale, 0.08, { Scale = 0.97 })
+	end)
+	win:_connect(btn.MouseButton1Up, function()
+		tween(scale, 0.12, { Scale = 1.03 }, STYLE_BACK)
+	end)
+	return btn, holder
+end
+
+local function secondaryButton(win, parent, text, x, y, w, h)
+	local theme = win.Theme
+	local btn = create("TextButton", {
+		Name = "Secondary",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(x + w / 2, y + h / 2),
+		Size = UDim2.fromOffset(w, h),
+		BackgroundColor3 = theme.Element,
+		AutoButtonColor = false,
+		BorderSizePixel = 0,
+		Font = FONT_BOLD,
+		TextSize = 14,
+		TextColor3 = legible(theme.Text, theme.Element, 9),
+		Text = text,
+		Parent = parent,
+	}, { corner(10), stroke(theme.Accent, 0.4, 1) })
+	local scale = create("UIScale", { Scale = 1, Parent = btn })
+	win:_connect(btn.MouseEnter, function()
+		tween(btn, 0.15, { BackgroundColor3 = theme.ElementHover })
+		tween(scale, 0.15, { Scale = 1.03 })
+	end)
+	win:_connect(btn.MouseLeave, function()
+		tween(btn, 0.15, { BackgroundColor3 = theme.Element })
+		tween(scale, 0.15, { Scale = 1 })
+	end)
+	return btn
+end
+
+-- keyCfg: nil (no key system) or the table from prepareKeySystem.
+-- startAtKey: skip the Enter step and the loading bar (Loader = false with a key system).
+function Library:_buildLoader(options, keyCfg, startAtKey)
 	local theme = self.Theme
+	local title = tostring(options.Title or "NovaUI")
+	local toggleName = (options.ToggleKey and options.ToggleKey.Name) or "RightShift"
+	local current = startAtKey and "Key" or "Welcome"
+	local interactive = { Welcome = {}, Key = {}, Load = {} }
+
+	-- Every colour on this screen is contrast-checked against what it sits on, whatever the theme.
+	local dark = luminance(theme.Background) <= 0.5
+	local cardBg = dark and mix(theme.Background, WHITE, 0.06) or theme.Background
+	local boxBg = dark and mix(cardBg, BLACK, 0.30) or WHITE -- inset field: darker than the card so light text pops
+	local textMain = legible(theme.Text, cardBg, 9)
+	local textSub = legible(mix(theme.Text, cardBg, 0.22), cardBg, 4.5)
+	local boxText = legible(theme.Text, boxBg, 9)
+	local boxHint = legible(mix(theme.Text, boxBg, 0.3), boxBg, 4.5)
+	local colBad = legible(COLOR_BAD, cardBg, 4.5)
+	local colGood = legible(COLOR_GOOD, cardBg, 4.5)
+
 	local card = create("CanvasGroup", {
 		Name = "Loader",
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(320, 196),
-		BackgroundColor3 = theme.Background,
+		Size = UDim2.fromOffset(CARD_W, CARD_H[current]),
+		BackgroundColor3 = cardBg,
 		BorderSizePixel = 0,
 		Parent = self.Gui,
-	}, { corner(16), stroke(theme.Stroke, 0.9, 1) })
-	create("UIScale", { Scale = 1, Parent = card })
-
-	textLabel({
-		Name = "Title",
-		Position = UDim2.fromOffset(0, 24),
-		Size = UDim2.new(1, 0, 0, 24),
-		Text = options.Title or "NovaUI",
-		Font = FONT_BOLD,
-		TextSize = 20,
-		TextColor3 = theme.Text,
-		TextXAlignment = Enum.TextXAlignment.Center,
-		Parent = card,
-	})
-	textLabel({
-		Name = "Subtitle",
-		Position = UDim2.fromOffset(0, 52),
-		Size = UDim2.new(1, 0, 0, 18),
-		Text = options.Subtitle or "Press enter to continue",
-		TextSize = 13,
-		Font = FONT_REGULAR,
-		TextColor3 = theme.Muted,
-		TextXAlignment = Enum.TextXAlignment.Center,
-		Parent = card,
-	})
-
-	local buttonHolder = create("Frame", {
-		Name = "EnterHolder",
-		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 0, 92),
-		Size = UDim2.fromOffset(240, 42),
-		BackgroundTransparency = 1,
-		Parent = card,
-	})
-	local enterBtn, setText = STYLES.Glow(self, buttonHolder, "Enter")
-
-	local barBack = create("Frame", {
-		Name = "BarBack",
-		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 0, 152),
-		Size = UDim2.fromOffset(240, 4),
-		BackgroundColor3 = theme.Off,
-		BackgroundTransparency = 1,
+	}, { corner(18), stroke(theme.Accent, 0.35, 1) })
+	-- soft accent glow across the top of the card
+	create("Frame", {
+		Name = "Glow",
+		Size = UDim2.new(1, 0, 0, 120),
+		BackgroundColor3 = theme.Accent,
 		BorderSizePixel = 0,
 		Parent = card,
+	}, {
+		create("UIGradient", {
+			Rotation = 90,
+			Transparency = NumberSequence.new(0.72, 1),
+		}),
+	})
+	self._loaderScale = create("UIScale", { Scale = 1, Parent = card })
+
+	-- grip: tells people the card can be dragged
+	create("Frame", {
+		Name = "Grip",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 10),
+		Size = UDim2.fromOffset(40, 4),
+		BackgroundColor3 = theme.Muted,
+		BackgroundTransparency = 0.5,
+		BorderSizePixel = 0,
+		Parent = card,
+	}, { pillCorner() })
+
+	local closeBtn = create("TextButton", {
+		Name = "CardClose",
+		Position = UDim2.new(1, -38, 0, 10),
+		Size = UDim2.fromOffset(28, 28),
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		BorderSizePixel = 0,
+		Font = FONT_BOLD,
+		TextSize = 20,
+		TextColor3 = textSub,
+		Text = "×",
+		ZIndex = 3,
+		Parent = card,
+	})
+	self:_connect(closeBtn.MouseEnter, function()
+		tween(closeBtn, 0.12, { TextColor3 = colBad })
+	end)
+	self:_connect(closeBtn.MouseLeave, function()
+		tween(closeBtn, 0.12, { TextColor3 = textSub })
+	end)
+	self:_connect(closeBtn.Activated, function()
+		self:Close()
+	end)
+
+	local logoFill = readableFill(theme.Accent)
+	create("Frame", {
+		Name = "Logo",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 26),
+		Size = UDim2.fromOffset(56, 56),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		Parent = card,
+	}, {
+		corner(16),
+		stroke(theme.AccentLight, 0.4, 2),
+		create("UIGradient", { Rotation = 90, Color = ColorSequence.new(logoFill, mix(logoFill, BLACK, 0.25)) }),
+	})
+	textLabel({
+		Name = "LogoText",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 26),
+		Size = UDim2.fromOffset(56, 56),
+		Text = string.upper(string.sub(title, 1, 1)),
+		Font = FONT_BOLD,
+		TextSize = 28,
+		TextColor3 = WHITE,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		ZIndex = 2,
+		Parent = card,
+	})
+	textLabel({
+		Name = "Title",
+		Position = UDim2.fromOffset(0, 92),
+		Size = UDim2.new(1, 0, 0, 30),
+		Text = title,
+		Font = FONT_BOLD,
+		TextSize = 24,
+		TextColor3 = textMain,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = card,
+	})
+	local subtitle = textLabel({
+		Name = "Subtitle",
+		Position = UDim2.fromOffset(0, 124),
+		Size = UDim2.new(1, 0, 0, 20),
+		Text = options.Subtitle or "Click Enter to continue",
+		TextSize = 14,
+		Font = FONT_MEDIUM,
+		TextColor3 = textSub,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = card,
+	})
+
+	local function stageFrame(name, height, visible)
+		return create("CanvasGroup", {
+			Name = name,
+			Position = UDim2.fromOffset(STAGE_X, STAGE_Y),
+			Size = UDim2.fromOffset(STAGE_W, height),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			GroupTransparency = visible and 0 or 1,
+			Visible = visible,
+			Parent = card,
+		})
+	end
+	local welcome = stageFrame("Welcome", 82, current == "Welcome")
+	local keyStage = stageFrame("KeyStage", 176, current == "Key")
+	local loadStage = stageFrame("LoadStage", 82, false)
+	local stages = { Welcome = welcome, Key = keyStage, Load = loadStage }
+
+	-- welcome stage ------------------------------------------------------
+	local enterBtn = primaryButton(self, welcome, "Enter  ›", 0, 0, STAGE_W, 48)
+	interactive.Welcome[1] = enterBtn
+	textLabel({
+		Name = "Hint",
+		Position = UDim2.fromOffset(0, 62),
+		Size = UDim2.new(1, 0, 0, 16),
+		Text = "Drag to move  ·  " .. toggleName .. " hides the menu",
+		Font = FONT_MEDIUM,
+		TextSize = 12,
+		TextColor3 = textSub,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = welcome,
+	})
+
+	-- key stage ----------------------------------------------------------
+	local boxHome = UDim2.fromOffset(0, 22)
+	textLabel({
+		Name = "KeyLabel",
+		Size = UDim2.new(1, 0, 0, 16),
+		Text = "ACCESS KEY",
+		Font = FONT_BOLD,
+		TextSize = 12,
+		TextColor3 = textSub,
+		Parent = keyStage,
+	})
+	local boxStroke = stroke(theme.Accent, 0.55, 1)
+	local box = create("TextBox", {
+		Name = "KeyBox",
+		Position = boxHome,
+		Size = UDim2.fromOffset(STAGE_W, 46),
+		BackgroundColor3 = boxBg,
+		BorderSizePixel = 0,
+		ClearTextOnFocus = false,
+		Font = FONT_MEDIUM,
+		PlaceholderText = "Paste your key here",
+		PlaceholderColor3 = boxHint,
+		Text = "",
+		TextColor3 = boxText,
+		TextSize = 16,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = keyStage,
+	}, { corner(10), padding(14, 0, 14, 0), boxStroke })
+	local hasLink = keyCfg ~= nil and keyCfg.link ~= nil
+	local verifyW = hasLink and 176 or STAGE_W
+	local verifyBtn = primaryButton(self, keyStage, "Verify", 0, 80, verifyW, 46)
+	interactive.Key[1] = box
+	interactive.Key[2] = verifyBtn
+	local linkBtn = nil
+	if hasLink then
+		linkBtn = secondaryButton(self, keyStage, keyCfg.linkText, verifyW + 8, 80, STAGE_W - verifyW - 8, 46)
+		interactive.Key[3] = linkBtn
+	end
+	local msg = textLabel({
+		Name = "Message",
+		Position = UDim2.fromOffset(0, 134),
+		Size = UDim2.new(1, 0, 0, 40),
+		Text = "",
+		Font = FONT_MEDIUM,
+		TextSize = 14,
+		TextWrapped = true,
+		TextColor3 = textSub,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Parent = keyStage,
+	})
+	local function setMsg(text, kind)
+		msg.Text = text
+		msg.TextColor3 = (kind == "bad" and colBad) or (kind == "good" and colGood) or textSub
+	end
+
+	-- loading stage ------------------------------------------------------
+	local barBack = create("Frame", {
+		Name = "BarBack",
+		Position = UDim2.fromOffset(0, 24),
+		Size = UDim2.fromOffset(STAGE_W, 6),
+		BackgroundColor3 = theme.Off,
+		BorderSizePixel = 0,
+		Parent = loadStage,
 	}, { pillCorner() })
 	local barFill = create("Frame", {
 		Name = "BarFill",
@@ -803,28 +1398,88 @@ function Library:_buildLoader(options)
 	}, { pillCorner() })
 	local status = textLabel({
 		Name = "Status",
-		Position = UDim2.fromOffset(0, 162),
+		Position = UDim2.fromOffset(0, 40),
 		Size = UDim2.new(1, 0, 0, 18),
 		Text = "",
-		TextSize = 12,
-		Font = FONT_REGULAR,
-		TextColor3 = theme.Muted,
+		TextSize = 13,
+		Font = FONT_MEDIUM,
+		TextColor3 = textSub,
 		TextXAlignment = Enum.TextXAlignment.Center,
-		Parent = card,
+		Parent = loadStage,
 	})
 
-	local entering = false
-	self:_connect(enterBtn.Activated, function()
-		if entering then
+	-- stage switching ----------------------------------------------------
+	local function showStage(name, instant)
+		current = name
+		self._loaderStage = name
+		for key, stage in pairs(stages) do
+			if key == name then
+				stage.Visible = true
+				if instant then
+					stage.GroupTransparency = 0
+				else
+					stage.GroupTransparency = 1
+					tween(stage, 0.25, { GroupTransparency = 0 })
+				end
+			elseif instant then
+				stage.Visible = false
+				stage.GroupTransparency = 1
+			else
+				tween(stage, 0.15, { GroupTransparency = 1 })
+				task.delay(0.15, function()
+					if not self._destroyed and current ~= key then
+						stage.Visible = false
+					end
+				end)
+			end
+		end
+		local size = UDim2.fromOffset(CARD_W, CARD_H[name])
+		if instant then
+			card.Size = size
+		else
+			tween(card, 0.3, { Size = size }, STYLE_QUART)
+		end
+	end
+	self._loaderStage = current
+
+	-- drag the card from anywhere except its own buttons / key box
+	local function overInteractive(input)
+		local px, py = input.Position.X, input.Position.Y
+		local targets = { closeBtn }
+		for _, obj in ipairs(interactive[current]) do
+			table.insert(targets, obj)
+		end
+		for _, obj in ipairs(targets) do
+			local pos, size = obj.AbsolutePosition, obj.AbsoluteSize
+			if px >= pos.X and px <= pos.X + size.X and py >= pos.Y and py <= pos.Y + size.Y then
+				return true
+			end
+		end
+		return false
+	end
+	self:_makeDraggable(card, card, overInteractive)
+
+	-- open the real window where the card was left ------------------------
+	local function openMain()
+		tween(card, 0.25, { GroupTransparency = 1 })
+		task.wait(0.25)
+		if self._destroyed then
 			return
 		end
-		entering = true
-		setText("Loading...")
-		barBack.BackgroundTransparency = 0
+		card.Visible = false
+		self._main.Position = card.Position
+		self._opened = true
+		self._loaderEnter = nil
+		self:_expand()
+		runGated(self, options.OnEnter, self)
+	end
+
+	local function runLoading()
+		showStage("Load")
+		barFill.Size = UDim2.fromScale(0, 1)
 		tween(barFill, 1.65, { Size = UDim2.fromScale(1, 1) }, STYLE_QUAD, DIR_INOUT)
 		task.spawn(function()
-			local steps = { "Loading modules", "Building interface", "Almost ready" }
-			for _, step in ipairs(steps) do
+			for _, step in ipairs({ "Loading modules", "Building interface", "Almost ready" }) do
 				if self._destroyed then
 					return
 				end
@@ -834,17 +1489,182 @@ function Library:_buildLoader(options)
 			if self._destroyed then
 				return
 			end
-			tween(card, 0.25, { GroupTransparency = 1 })
-			task.wait(0.25)
-			if self._destroyed then
+			openMain()
+		end)
+	end
+
+	-- key entry ----------------------------------------------------------
+	local fails, lockedUntil, lockLevel, lockToken = 0, 0, 0, 0
+	local busy, attemptId = false, 0
+
+	local function shake()
+		task.spawn(function()
+			for _, dx in ipairs({ 8, -8, 5, -5, 0 }) do
+				if self._destroyed then
+					return
+				end
+				tween(box, 0.05, { Position = UDim2.fromOffset(dx, 22) })
+				task.wait(0.05)
+			end
+		end)
+	end
+
+	local function startLock()
+		lockLevel = lockLevel + 1
+		local seconds = math.min(30 * 2 ^ (lockLevel - 1), 600)
+		lockedUntil = os.clock() + seconds
+		lockToken = lockToken + 1
+		local token = lockToken
+		task.spawn(function()
+			while not self._destroyed and lockToken == token do
+				local left = math.ceil(lockedUntil - os.clock())
+				if left <= 0 then
+					break
+				end
+				setMsg("Too many wrong keys. Try again in " .. left .. "s.", "bad")
+				task.wait(1)
+			end
+			if not self._destroyed and lockToken == token and not isUnlocked(self) then
+				fails = 0
+				setMsg("You can try again now.", "muted")
+			end
+		end)
+	end
+
+	local function submit()
+		if self._destroyed or isUnlocked(self) or busy or not keyCfg then
+			return
+		end
+		if keyCfg.misconfigured then
+			setMsg("This key system is not set up correctly.", "bad")
+			return
+		end
+		local waitLeft = lockedUntil - os.clock()
+		if waitLeft > 0 then
+			setMsg("Too many wrong keys. Try again in " .. math.ceil(waitLeft) .. "s.", "bad")
+			return
+		end
+		local input = trimText(box.Text)
+		if input == "" then
+			setMsg("Type your key first.", "bad")
+			return
+		end
+		busy = true
+		attemptId = attemptId + 1
+		local id = attemptId
+		verifyBtn.Text = "Checking..."
+		setMsg("Checking key...", "muted")
+		-- a Validate that never answers must not freeze the screen
+		task.delay(keyCfg.timeout, function()
+			if not self._destroyed and busy and attemptId == id then
+				attemptId = attemptId + 1
+				busy = false
+				verifyBtn.Text = "Verify"
+				setMsg("No answer from the key server. Try again.", "bad")
+			end
+		end)
+		task.spawn(function()
+			local ok, payload = checkKey(keyCfg, input)
+			if self._destroyed or attemptId ~= id then
 				return
 			end
-			card.Visible = false
-			self._opened = true
-			self:_expand()
-			safe(options.OnEnter, self)
+			busy = false
+			verifyBtn.Text = "Verify"
+			if ok then
+				setMsg("Key accepted", "good")
+				unlockWindow(self, payload)
+				task.delay(0.55, function()
+					if self._destroyed then
+						return
+					end
+					if startAtKey then
+						openMain()
+					else
+						runLoading()
+					end
+				end)
+				return
+			end
+			fails = fails + 1
+			local left = keyCfg.maxAttempts - fails
+			if left <= 0 then
+				startLock()
+			else
+				setMsg("Invalid key. " .. left .. (left == 1 and " attempt" or " attempts") .. " left.", "bad")
+			end
+			shake()
 		end)
-	end)
+	end
+
+	local function goKey(instant)
+		subtitle.Text = (keyCfg and keyCfg.note) or "Enter your key to continue"
+		showStage("Key", instant)
+		if keyCfg and keyCfg.misconfigured then
+			setMsg("This key system is not set up correctly.", "bad")
+		end
+		task.delay(0.35, function()
+			if not self._destroyed and current == "Key" then
+				pcall(function()
+					box:CaptureFocus()
+				end)
+			end
+		end)
+	end
+
+	if keyCfg then
+		self:_connect(verifyBtn.Activated, submit)
+		self:_connect(box.FocusLost, function(enterPressed)
+			tween(boxStroke, 0.15, { Transparency = 0.55 })
+			if enterPressed then
+				submit()
+			end
+		end)
+		self:_connect(box.Focused, function()
+			tween(boxStroke, 0.15, { Transparency = 0.1 })
+		end)
+		if linkBtn then
+			self:_connect(linkBtn.Activated, function()
+				local link = keyCfg.link
+				local copied = false
+				pcall(function()
+					local copier = (type(setclipboard) == "function" and setclipboard)
+						or (type(toclipboard) == "function" and toclipboard)
+					if copier then
+						copier(link)
+						copied = true
+					end
+				end)
+				if copied then
+					setMsg("Link copied to your clipboard.", "good")
+				else
+					setMsg("Open this link: " .. link, "muted")
+				end
+			end)
+		end
+	end
+
+	-- enter ----------------------------------------------------------------
+	local entering = startAtKey == true
+	local function startEnter()
+		if entering or self._destroyed then
+			return
+		end
+		entering = true
+		if keyCfg and not isUnlocked(self) then
+			goKey(false)
+		else
+			runLoading()
+		end
+	end
+	self._loaderEnter = function()
+		if current == "Welcome" then
+			startEnter()
+		end
+	end
+	self:_connect(enterBtn.Activated, startEnter)
+	if startAtKey then
+		goKey(true)
+	end
 
 	return card
 end
@@ -901,17 +1721,33 @@ function Library.new(options)
 	self.Visible = false
 	self.Minimized = false
 
+	-- Optional key system. No KeySystem option = no gate, the window opens after Enter as before.
+	local keyCfg = nil
+	if options.KeySystem ~= nil and options.KeySystem ~= false then
+		keyCfg = prepareKeySystem(options.KeySystem)
+	end
+	if not keyCfg then
+		gate[self] = true
+	end
+
 	-- Re-running the script replaces the old window instead of stacking a second one.
+	-- Only a handle with Destroy() is published, never the window table itself.
 	local envOk, genv = pcall(function()
 		return getgenv()
 	end)
-	if envOk and type(genv) == "table" and genv.__NovaUI and genv.__NovaUI ~= self then
+	local handle = {
+		Destroy = function()
+			self:Destroy()
+		end,
+	}
+	self._handle = handle
+	if envOk and type(genv) == "table" and genv.__NovaUI and genv.__NovaUI ~= handle then
 		pcall(function()
 			genv.__NovaUI:Destroy()
 		end)
 	end
 	if envOk and type(genv) == "table" then
-		genv.__NovaUI = self
+		genv.__NovaUI = handle
 	end
 
 	local parent = resolveParent(options.Parent)
@@ -1013,7 +1849,7 @@ function Library.new(options)
 		self:SetMinimized(not self.Minimized)
 	end)
 	self:_connect(closeButton.Activated, function()
-		self:Destroy()
+		self:Close()
 	end)
 
 	create("Frame", {
@@ -1050,7 +1886,38 @@ function Library.new(options)
 		CanvasSize = UDim2.new(),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		Parent = sidebar,
-	}, { listLayout(4), padding(8, 10, 8, 10) })
+	})
+	-- the highlight sits in the scrolling canvas next to (not inside) the layout holder,
+	-- so the list layout leaves it alone and it can glide between tabs
+	self._tabIndicator = create("Frame", {
+		Name = "Indicator",
+		Position = UDim2.fromOffset(8, TAB_TOP),
+		Size = UDim2.new(1, -16, 0, TAB_H),
+		BackgroundColor3 = theme.Element,
+		BorderSizePixel = 0,
+		Visible = false,
+		ZIndex = 1,
+		Parent = self._tabList,
+	}, {
+		corner(8),
+		create("Frame", {
+			Name = "Bar",
+			AnchorPoint = Vector2.new(0, 0.5),
+			Position = UDim2.new(0, 4, 0.5, 0),
+			Size = UDim2.fromOffset(3, 18),
+			BackgroundColor3 = theme.Accent,
+			BorderSizePixel = 0,
+		}, { pillCorner() }),
+	})
+	self._tabHolder = create("Frame", {
+		Name = "Tabs",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = self._tabList,
+	}, { listLayout(TAB_GAP), padding(8, TAB_TOP, 8, 10) })
 	self._content = create("Frame", {
 		Name = "Content",
 		Position = UDim2.fromOffset(SIDEBAR_W, 0),
@@ -1130,24 +1997,67 @@ function Library.new(options)
 		end
 		if input.KeyCode == toggleKey then
 			self:ToggleVisible()
+		elseif input.KeyCode == Enum.KeyCode.Return and self._loaderEnter then
+			self._loaderEnter() -- Return = click Enter on the Enter screen
 		end
 	end)
 
-	if options.Loader == false then
+	if keyCfg then
+		-- locked: the key screen always shows; Loader = false only skips the Enter + loading steps
+		self._loader = self:_buildLoader(options, keyCfg, options.Loader == false)
+	elseif options.Loader == false then
 		self._opened = true
 		self:_expand()
-		safe(options.OnEnter, self)
+		runGated(self, options.OnEnter, self)
 	else
-		self._loader = self:_buildLoader(options)
+		self._loader = self:_buildLoader(options, nil, false)
 	end
+	self:_updateScale()
 
-	Library._windows = Library._windows or {}
-	table.insert(Library._windows, self)
-	Library._lastWindow = self
+	table.insert(liveWindows, self)
+
+	if keyCfg then
+		-- Hold the caller here until a valid key is entered, so the code after CreateLib
+		-- (tabs, buttons, the script's own logic) cannot run on a locked window.
+		while not isUnlocked(self) and not self._destroyed do
+			task.wait(0.1)
+		end
+		if not isUnlocked(self) then
+			error("[NovaUI] key system: the window was closed before a valid key was entered", 0)
+		end
+		return self, payloads[self]
+	end
 	return self
 end
 
 Library.CreateWindow = Library.new
+
+-- Animated close: the window folds away like it opened, then is destroyed.
+-- (Destroy() stays instant.)
+function Library:Close()
+	if self._destroyed or self._closing then
+		return
+	end
+	self._closing = true
+	if self._opened and self._main.Visible then
+		self:_collapse(function()
+			self:Destroy()
+		end)
+		return
+	end
+	local card = self._loader
+	if not self._opened and card and card.Visible then
+		tween(card, 0.2, { GroupTransparency = 1 })
+		if self._loaderScale then
+			tween(self._loaderScale, 0.2, { Scale = self._loaderScale.Scale * 0.9 }, STYLE_QUART)
+		end
+		task.delay(0.22, function()
+			self:Destroy()
+		end)
+		return
+	end
+	self:Destroy()
+end
 
 function Library:Destroy()
 	if self._destroyed then
@@ -1155,18 +2065,16 @@ function Library:Destroy()
 	end
 	self._destroyed = true
 	-- forget this window; module-level calls fall back to the newest one still alive
-	local live = Library._windows or {}
-	for i, w in ipairs(live) do
+	for i, w in ipairs(liveWindows) do
 		if w == self then
-			table.remove(live, i)
+			table.remove(liveWindows, i)
 			break
 		end
 	end
-	Library._lastWindow = live[#live]
 	local envOk, genv = pcall(function()
 		return getgenv()
 	end)
-	if envOk and type(genv) == "table" and genv.__NovaUI == self then
+	if envOk and type(genv) == "table" and genv.__NovaUI == self._handle then
 		genv.__NovaUI = nil
 	end
 	for _, conn in ipairs(self._conns) do
@@ -1246,24 +2154,23 @@ end
 -- Tabs
 ----------------------------------------------------------------------
 
+local PAGE_IN, PAGE_OUT = 0.28, 0.14
+
 local function styleTab(tab, selected)
 	local theme = tab.Window.Theme
-	tween(tab._button, 0.15, {
-		BackgroundTransparency = selected and 0 or 1,
-		TextColor3 = selected and theme.Text or theme.Muted,
-	})
-	tween(tab._bar, 0.15, { BackgroundTransparency = selected and 0 or 1 })
+	tween(tab._button, 0.2, { TextColor3 = selected and theme.Text or theme.Muted })
 end
 
 function Library:Tab(name, icon)
 	local theme = self.Theme
 	name = tostring(name or "Tab")
-	local tab = setmetatable({ Window = self, Name = name, _order = 0 }, Tab)
+	local tab = setmetatable({ Window = self, Name = name, _order = 0, _index = #self.Tabs + 1 }, Tab)
 
+	-- the button is transparent: the sliding highlight behind it shows which tab is active
 	tab._button = create("TextButton", {
 		Name = "Tab_" .. name,
-		LayoutOrder = #self.Tabs + 1,
-		Size = UDim2.new(1, 0, 0, 36),
+		LayoutOrder = tab._index,
+		Size = UDim2.new(1, 0, 0, TAB_H),
 		BackgroundColor3 = theme.Element,
 		BackgroundTransparency = 1,
 		AutoButtonColor = false,
@@ -1273,19 +2180,19 @@ function Library:Tab(name, icon)
 		TextColor3 = theme.Muted,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Text = (icon and (icon .. "  ") or "") .. name,
-		Parent = self._tabList,
+		Parent = self._tabHolder,
 	}, { corner(8), padding(16, 0, 8, 0) })
-	tab._bar = create("Frame", {
-		Name = "Bar",
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.new(0, -12, 0.5, 0),
-		Size = UDim2.fromOffset(3, 18),
-		BackgroundColor3 = theme.Accent,
+
+	-- every page sits in a CanvasGroup so the whole page can fade as one
+	tab._holder = create("CanvasGroup", {
+		Name = "Holder_" .. name,
+		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		Parent = tab._button,
-	}, { pillCorner() })
-
+		GroupTransparency = 1,
+		Visible = false,
+		Parent = self._content,
+	})
 	tab.Page = create("ScrollingFrame", {
 		Name = "Page_" .. name,
 		Size = UDim2.fromScale(1, 1),
@@ -1295,8 +2202,7 @@ function Library:Tab(name, icon)
 		ScrollBarImageColor3 = theme.Accent,
 		CanvasSize = UDim2.new(),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
-		Visible = false,
-		Parent = self._content,
+		Parent = tab._holder,
 	}, { listLayout(8), padding(12, 12, 14, 12) })
 
 	self:_connect(tab._button.MouseEnter, function()
@@ -1321,6 +2227,8 @@ function Library:Tab(name, icon)
 	return tab
 end
 
+-- Smooth navigation: the sidebar highlight glides to the new tab while the old page fades
+-- up and out and the new page rises in. Rapid clicking is safe (hide tokens + per-property tweens).
 function Library:SelectTab(target)
 	local tab = target
 	if type(target) == "string" then
@@ -1330,15 +2238,44 @@ function Library:SelectTab(target)
 		warn("[NovaUI] SelectTab: unknown tab " .. tostring(target))
 		return
 	end
-	self:_hideTip()
-	for _, other in ipairs(self.Tabs) do
-		local isSelected = other == tab
-		other.Page.Visible = isSelected
-		styleTab(other, isSelected)
+	local previous = self._selected
+	if previous == tab then
+		return
 	end
+	self:_hideTip()
 	self._selected = tab
-	tab.Page.Position = UDim2.fromOffset(0, 10)
-	tween(tab.Page, 0.2, { Position = UDim2.fromOffset(0, 0) })
+	for _, other in ipairs(self.Tabs) do
+		styleTab(other, other == tab)
+	end
+
+	local indicator = self._tabIndicator
+	local goal = UDim2.fromOffset(8, TAB_TOP + (tab._index - 1) * (TAB_H + TAB_GAP))
+	if previous == nil then
+		-- very first tab: show it in place, nothing to animate from
+		indicator.Position = goal
+		indicator.Visible = true
+		tab._holder.Visible = true
+		tab._holder.GroupTransparency = 0
+		return
+	end
+	tween(indicator, 0.35, { Position = goal }, STYLE_QUART)
+
+	local dir = tab._index > previous._index and 1 or -1
+	previous._hideToken = (previous._hideToken or 0) + 1
+	local hideToken = previous._hideToken
+	tween(previous._holder, PAGE_OUT, { GroupTransparency = 1 })
+	tween(previous.Page, PAGE_OUT, { Position = UDim2.fromOffset(0, -8 * dir) })
+	task.delay(PAGE_OUT, function()
+		if not self._destroyed and previous._hideToken == hideToken and self._selected ~= previous then
+			previous._holder.Visible = false
+		end
+	end)
+
+	tab._hideToken = (tab._hideToken or 0) + 1 -- cancels a pending hide of this same page
+	tab._holder.Visible = true
+	tab.Page.Position = UDim2.fromOffset(0, 14 * dir)
+	tween(tab._holder, PAGE_IN, { GroupTransparency = 0 }, STYLE_QUART)
+	tween(tab.Page, PAGE_IN, { Position = UDim2.fromOffset(0, 0) }, STYLE_QUART)
 end
 
 ----------------------------------------------------------------------
@@ -1425,7 +2362,7 @@ function Tab:Button(text, callback, opts)
 	local clickable, setText = builder(win, row, tostring(text), opts)
 
 	win:_connect(clickable.Activated, function()
-		safe(callback)
+		runGated(win, callback)
 	end)
 	win:_attachTip(clickable, opts.Tooltip)
 
@@ -1501,7 +2438,7 @@ function Tab:Toggle(text, default, callback, opts)
 		state = value
 		render()
 		if not silent then
-			safe(callback, state)
+			runGated(win, callback, state)
 		end
 	end
 
@@ -1638,7 +2575,7 @@ function Tab:Slider(text, min, max, default, callback, opts)
 		value = v
 		render()
 		if not silent then
-			safe(callback, value)
+			runGated(win, callback, value)
 		end
 	end
 
@@ -1733,7 +2670,7 @@ function Tab:Input(text, placeholder, callback, opts)
 	win:_connect(box.FocusLost, function(enterPressed)
 		tween(boxStroke, 0.15, { Transparency = 1 })
 		if enterPressed or opts.FireOnBlur then
-			safe(callback, box.Text)
+			runGated(win, callback, box.Text)
 		end
 	end)
 	win:_attachTip(card, opts.Tooltip)
@@ -1829,7 +2766,7 @@ function Tab:Keybind(text, default, callback, opts)
 			return
 		end
 		if key ~= nil and input.KeyCode == key then
-			safe(callback)
+			runGated(win, callback)
 		end
 	end)
 	win:_attachTip(card, opts.Tooltip)
@@ -1957,7 +2894,7 @@ function Tab:Dropdown(text, list, callback, opts)
 			win:_connect(b.Activated, function()
 				valueLabel.Text = items[index]
 				setOpen(false)
-				safe(callback, items[index])
+				runGated(win, callback, items[index])
 			end)
 			buttons[index] = b
 		end
@@ -2049,7 +2986,7 @@ function Tab:ColorPicker(text, default, callback, opts)
 	local function push()
 		color = Color3.fromRGB(r, g, b)
 		swatch.BackgroundColor3 = color
-		safe(callback, color)
+		runGated(win, callback, color)
 	end
 	host:Slider("Red", 0, 255, r, function(v)
 		r = v
@@ -2129,7 +3066,7 @@ local function targetWindow(self)
 	if self ~= Library and type(self) == "table" and self._main then
 		return self
 	end
-	return Library._lastWindow
+	return liveWindows[#liveWindows]
 end
 
 -- Works as Library:ToggleUI() (last window) and Window:ToggleUI().
@@ -2267,6 +3204,11 @@ end
 
 function Section:NewColorPicker(name, info, default, callback)
 	self._tab:ColorPicker(name, default, callback, { Tooltip = tipFor(name, info) })
+end
+
+-- Library.HashKey("hello123") -> "nv1$..." string for KeySystem.KeyHash, so the plain key never has to sit in a script.
+function Library.HashKey(key, salt)
+	return hashKey(key, salt)
 end
 
 return Library

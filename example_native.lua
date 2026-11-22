@@ -74,5 +74,5 @@ Settings:Toggle("Fly (mirrors the Main toggle)", false, function(isOn)
 	fly:Set(isOn, true) -- true = update the switch without re-running its callback
 end)
 Settings:Button("Close menu", function()
-	Window:Destroy()
+	Window:Close()
 end, "Push")
