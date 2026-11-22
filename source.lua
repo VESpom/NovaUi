@@ -1092,6 +1092,10 @@ function Library:_updateScale()
 		local ls = math.min(1, (vp.X - 24) / CARD_W, (vp.Y - 24) / CARD_H.Key)
 		self._loaderScale.Scale = math.max(ls, 0.5)
 	end
+	self:_settle(self._main)
+	if self._loader and self._loader.Visible then
+		self:_settle(self._loader)
+	end
 end
 
 function Library:_showTip(target, title, body)
@@ -1137,6 +1141,59 @@ function Library:_attachTip(target, tip)
 end
 
 -- `blocker(input)` (optional) returns true for presses that must NOT start a drag, e.g. on a button.
+----------------------------------------------------------------------
+-- Keep on screen. The WHOLE window (not just its centre) stays inside the viewport, so it can
+-- never end up with its title bar out of reach. While dragging, the edge pushes back softly
+-- (rubber band, max 40px); on release, show and resize it settles back in with a short glide.
+----------------------------------------------------------------------
+
+local EDGE_MARGIN = 8
+local MAX_OVERSHOOT = 40
+
+local function insideCenter(cx, cy, w, h, vp)
+	local hw, hh = w / 2 + EDGE_MARGIN, h / 2 + EDGE_MARGIN
+	local x = (hw * 2 >= vp.X) and vp.X / 2 or clamp(cx, hw, vp.X - hw)
+	local y = (hh * 2 >= vp.Y) and vp.Y / 2 or clamp(cy, hh, vp.Y - hh)
+	return x, y
+end
+
+local function softOvershoot(excess)
+	local sign = excess < 0 and -1 or 1
+	return sign * math.min(MAX_OVERSHOOT, math.abs(excess) * 0.3)
+end
+
+-- Final on-screen size (px) of a draggable target, ignoring any animation in progress.
+function Library:_boundsOf(target)
+	if target == self._main then
+		local scale = self._uiScale and self._uiScale.Scale or 1
+		local h = self.Minimized and TOPBAR_H or self._size.Y
+		return self._size.X * scale, h * scale
+	end
+	local scale = self._loaderScale and self._loaderScale.Scale or 1
+	return CARD_W * scale, CARD_H[self._loaderStage or "Welcome"] * scale
+end
+
+function Library:_settle(target, instant)
+	if self._destroyed or self._keepOnScreen == false or not target then
+		return
+	end
+	local vp = viewport()
+	local pos = target.Position
+	local cx = vp.X * pos.X.Scale + pos.X.Offset
+	local cy = vp.Y * pos.Y.Scale + pos.Y.Offset
+	local w, h = self:_boundsOf(target)
+	local nx, ny = insideCenter(cx, cy, w, h, vp)
+	if math.abs(nx - cx) < 0.5 and math.abs(ny - cy) < 0.5 then
+		return
+	end
+	local goal = UDim2.new(pos.X.Scale, nx - vp.X * pos.X.Scale, pos.Y.Scale, ny - vp.Y * pos.Y.Scale)
+	if instant then
+		tween(target, 0, { Position = goal })
+	else
+		tween(target, 0.28, { Position = goal }, STYLE_QUART)
+	end
+end
+
 function Library:_makeDraggable(handle, target, blocker)
 	local dragging = false
 	local dragInput = nil
@@ -1147,6 +1204,7 @@ function Library:_makeDraggable(handle, target, blocker)
 			dragging = true
 			dragInput = input
 			startX, startY = input.Position.X, input.Position.Y
+			tween(target, 0, { Position = target.Position }) -- stop a settle glide that is still running
 			startPos = target.Position
 			self:_hideTip()
 		end
@@ -1162,9 +1220,15 @@ function Library:_makeDraggable(handle, target, blocker)
 		end
 		local vp = viewport()
 		local dx, dy = input.Position.X - startX, input.Position.Y - startY
-		-- keep the window's centre on screen so it can never be lost
-		local cx = clamp(vp.X * startPos.X.Scale + startPos.X.Offset + dx, 0, vp.X)
-		local cy = clamp(vp.Y * startPos.Y.Scale + startPos.Y.Offset + dy, 0, vp.Y)
+		local cx = vp.X * startPos.X.Scale + startPos.X.Offset + dx
+		local cy = vp.Y * startPos.Y.Scale + startPos.Y.Offset + dy
+		if self._keepOnScreen == false then
+			cx, cy = clamp(cx, 0, vp.X), clamp(cy, 0, vp.Y) -- legacy: only the centre is kept on screen
+		else
+			local w, h = self:_boundsOf(target)
+			local ix, iy = insideCenter(cx, cy, w, h, vp)
+			cx, cy = ix + softOvershoot(cx - ix), iy + softOvershoot(cy - iy)
+		end
 		target.Position = UDim2.new(startPos.X.Scale, cx - vp.X * startPos.X.Scale, startPos.Y.Scale, cy - vp.Y * startPos.Y.Scale)
 	end)
 	self:_connect(UserInputService.InputEnded, function(input)
@@ -1173,6 +1237,7 @@ function Library:_makeDraggable(handle, target, blocker)
 		end
 		if input == dragInput or (input.UserInputType == Enum.UserInputType.MouseButton1 and dragInput.UserInputType == Enum.UserInputType.MouseButton1) then
 			dragging = false
+			self:_settle(target)
 		end
 	end)
 end
@@ -1188,6 +1253,7 @@ function Library:_expand()
 	main.Size = UDim2.fromOffset(self._size.X * 0.7, TOPBAR_H)
 	local height = self.Minimized and TOPBAR_H or self._size.Y
 	tween(main, 0.45, { Size = UDim2.fromOffset(self._size.X, height) }, STYLE_BACK)
+	self:_settle(main) -- reopening near an edge can never leave it stuck off-screen
 end
 
 -- Reverse of _expand: the window folds down to a title bar, then flattens away.
@@ -1245,6 +1311,7 @@ function Library:SetMinimized(minimized)
 	local height = self.Minimized and TOPBAR_H or self._size.Y
 	tween(self._main, 0.3, { Size = UDim2.fromOffset(self._size.X, height) }, STYLE_QUART)
 	self._minButton.Text = self.Minimized and "+" or "–"
+	self:_settle(self._main)
 end
 
 ----------------------------------------------------------------------
@@ -2049,6 +2116,7 @@ function Library.new(options)
 		self._scheme.SchemeColor = options.Accent
 	end
 	applyScheme(self.Theme, self._scheme)
+	self._baseScheme = completeScheme(self._scheme)
 	local theme = self.Theme
 
 	self._conns = {}
@@ -2061,6 +2129,7 @@ function Library.new(options)
 	self.Minimized = false
 	self._hotkeys = {}
 	self._hotkeyIds = {}
+	self._keepOnScreen = options.KeepOnScreen ~= false
 	self._showChips = options.Hotkeys ~= false -- Hotkeys = false hides the hotkey boxes (code-set Hotkey keys still work)
 
 	-- Optional key system. No KeySystem option = no gate, the window opens after Enter as before.
@@ -2138,7 +2207,7 @@ function Library.new(options)
 	textLabel({
 		Name = "Title",
 		Position = UDim2.fromOffset(36, 0),
-		Size = UDim2.new(1, -140, 1, 0),
+		Size = UDim2.new(1, -176, 1, 0),
 		Text = options.Title or "NovaUI",
 		Font = FONT_BOLD,
 		TextSize = 15,
@@ -2150,7 +2219,7 @@ function Library.new(options)
 		textLabel({
 			Name = "Subtitle",
 			AnchorPoint = Vector2.new(1, 0.5),
-			Position = UDim2.new(1, -84, 0.5, 0),
+			Position = UDim2.new(1, -118, 0.5, 0),
 			Size = UDim2.fromOffset(110, 20),
 			Text = options.Subtitle,
 			Font = FONT_REGULAR,
@@ -2185,6 +2254,11 @@ function Library.new(options)
 		end)
 		return button
 	end
+	self._gear = windowButton("Settings", "⚙", -78, theme.Accent)
+	self._gear.TextSize = 17
+	self:_connect(self._gear.Activated, function()
+		self:ToggleSettings()
+	end)
 	self._minButton = windowButton("Minimize", "–", -44, theme.Text)
 	local closeButton = windowButton("Close", "×", -10, Color3.fromRGB(255, 95, 110))
 	self:_connect(self._minButton.Activated, function()
@@ -2581,6 +2655,9 @@ function Library:SelectTab(target)
 	if not tab or tab.Window ~= self then
 		warn("[NovaUI] SelectTab: unknown tab " .. tostring(target))
 		return
+	end
+	if self._settingsOpen then
+		self:SetSettingsOpen(false)
 	end
 	local previous = self._selected
 	if previous == tab then
@@ -3522,15 +3599,15 @@ function Tab:ColorPicker(text, default, callback, opts)
 		swatch.BackgroundColor3 = color
 		runGated(win, callback, color)
 	end
-	host:Slider("Red", 0, 255, r, function(v)
+	local sr = host:Slider("Red", 0, 255, r, function(v)
 		r = v
 		push()
 	end)
-	host:Slider("Green", 0, 255, g, function(v)
+	local sg = host:Slider("Green", 0, 255, g, function(v)
 		g = v
 		push()
 	end)
-	host:Slider("Blue", 0, 255, b, function(v)
+	local sb = host:Slider("Blue", 0, 255, b, function(v)
 		b = v
 		push()
 	end)
@@ -3546,7 +3623,384 @@ function Tab:ColorPicker(text, default, callback, opts)
 		Get = function()
 			return color
 		end,
+		-- Set(color3, silent): moves the sliders and swatch; silent = true skips the callback
+		Set = function(_, c, silent)
+			if typeof(c) ~= "Color3" then
+				return
+			end
+			r, g, b = math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5)
+			color = Color3.fromRGB(r, g, b)
+			swatch.BackgroundColor3 = color
+			sr:Set(r, true)
+			sg:Set(g, true)
+			sb:Set(b, true)
+			if not silent then
+				runGated(win, callback, color)
+			end
+		end,
 	}
+end
+
+----------------------------------------------------------------------
+-- Settings panel (gear button): themes, colours, presets, window options
+----------------------------------------------------------------------
+
+local PRESET_FILE = "NovaUI/presets.txt"
+local PRESET_MAX_NAME = 24
+local PRESET_MAX = 40
+local SCHEME_LETTER = { SchemeColor = "S", Background = "B", Header = "H", TextColor = "T", ElementColor = "E" }
+
+local function toHex(c)
+	return string.format("%02x%02x%02x", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+local function fromHex(h)
+	if type(h) ~= "string" or not string.match(h, "^%x%x%x%x%x%x$") then
+		return nil
+	end
+	return Color3.fromRGB(tonumber(string.sub(h, 1, 2), 16), tonumber(string.sub(h, 3, 4), 16), tonumber(string.sub(h, 5, 6), 16))
+end
+
+-- Look code: "NVP1;S=rrggbb;B=..;H=..;T=..;E=..;K=1[;G=<background code>]". Pure text, safe to paste around.
+local function encodeLook(win)
+	local parts = { "NVP1" }
+	for _, key in ipairs(SCHEME_KEYS) do
+		table.insert(parts, SCHEME_LETTER[key] .. "=" .. toHex(win._scheme[key]))
+	end
+	table.insert(parts, "K=" .. (win._keepOnScreen and "1" or "0"))
+	if win._bgEncode then
+		local g = win:_bgEncode()
+		if g and g ~= "" then
+			table.insert(parts, "G=" .. g)
+		end
+	end
+	return table.concat(parts, ";")
+end
+
+local function decodeLook(code)
+	if type(code) ~= "string" then
+		return nil, "empty"
+	end
+	code = string.gsub(code, "^%s+", "")
+	code = string.gsub(code, "%s+$", "")
+	if #code > 4000 then
+		return nil, "too long"
+	end
+	local fields = {}
+	for piece in string.gmatch(code, "[^;]+") do
+		table.insert(fields, piece)
+	end
+	if fields[1] ~= "NVP1" then
+		return nil, "not a NovaUI preset"
+	end
+	local look = { scheme = {} }
+	for i = 2, #fields do
+		local k, v = string.match(fields[i], "^(%a)=(.*)$")
+		if k then
+			for key, letter in pairs(SCHEME_LETTER) do
+				if letter == k then
+					local c = fromHex(v)
+					if not c then
+						return nil, "bad colour for " .. key
+					end
+					look.scheme[key] = c
+				end
+			end
+			if k == "K" then
+				look.keep = v ~= "0"
+			elseif k == "G" then
+				look.bg = v
+			end
+		end
+	end
+	for _, key in ipairs(SCHEME_KEYS) do
+		if not look.scheme[key] then
+			return nil, "missing " .. key
+		end
+	end
+	return look
+end
+
+-- presets are shared by every window in this session and saved to disk when the executor can
+local presetStore = nil
+local function presets()
+	if presetStore then
+		return presetStore
+	end
+	presetStore = { names = {}, codes = {} }
+	local read = envFn(function() return readfile end)
+	local exists = envFn(function() return isfile end)
+	if read and exists then
+		local ok, text = pcall(function()
+			if exists(PRESET_FILE) then
+				return read(PRESET_FILE)
+			end
+		end)
+		if ok and type(text) == "string" then
+			for line in string.gmatch(text, "[^\r\n]+") do
+				local name, code = string.match(line, "^([^\t]+)\t(.+)$")
+				if name and #presetStore.names < PRESET_MAX and decodeLook(code) then
+					if not presetStore.codes[name] then
+						table.insert(presetStore.names, name)
+					end
+					presetStore.codes[name] = code
+				end
+			end
+		end
+	end
+	return presetStore
+end
+
+local function persistPresets()
+	local write, mk, isf = envFn(function() return writefile end), envFn(function() return makefolder end), envFn(function() return isfolder end)
+	if not write then
+		return false
+	end
+	local store = presets()
+	local lines = {}
+	for _, name in ipairs(store.names) do
+		table.insert(lines, name .. "\t" .. store.codes[name])
+	end
+	return (pcall(function()
+		if mk and not (isf and isf("NovaUI")) then
+			mk("NovaUI")
+		end
+		write(PRESET_FILE, table.concat(lines, "\n"))
+	end))
+end
+
+local function cleanPresetName(text)
+	text = tostring(text or "")
+	text = string.gsub(text, "[%c\t;=]", "")
+	text = string.gsub(text, "^%s+", "")
+	text = string.gsub(text, "%s+$", "")
+	return string.sub(text, 1, PRESET_MAX_NAME)
+end
+
+function Library:_applyLook(look)
+	Library._recolor(self, look.scheme)
+	if look.keep ~= nil then
+		self._keepOnScreen = look.keep
+		if look.keep then
+			self:_settle(self._main)
+		end
+	end
+	if look.bg and self._bgDecode then
+		self:_bgDecode(look.bg)
+	end
+	if self._syncSettings then
+		self:_syncSettings()
+	end
+end
+
+function Library:IsSettingsOpen()
+	return self._settingsOpen == true
+end
+
+function Library:_buildSettings()
+	if self._settings then
+		return self._settings
+	end
+	local win = self
+	local theme = self.Theme
+	local panel = create("CanvasGroup", {
+		Name = "SettingsPanel",
+		Position = UDim2.fromOffset(0, TOPBAR_H + 1),
+		Size = UDim2.new(1, 0, 1, -(TOPBAR_H + 1)),
+		BackgroundColor3 = theme.Background,
+		BorderSizePixel = 0,
+		GroupTransparency = 1,
+		Visible = false,
+		ZIndex = 5,
+		Parent = self._main,
+	})
+	local page = create("ScrollingFrame", {
+		Name = "SettingsPage",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = theme.Accent,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		Parent = panel,
+	}, { listLayout(8), padding(16, 12, 18, 14) })
+	local host = setmetatable({ Window = self, Name = "Settings", Page = page, _order = 0 }, Tab)
+	local S = { panel = panel, page = page, host = host, pickers = {} }
+	self._settings = S
+
+	host:Section("Appearance")
+	local names = {}
+	for name in pairs(SCHEMES) do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	S.themeDropdown = host:Dropdown("Theme", names, function(name)
+		if SCHEMES[name] then
+			Library._recolor(win, SCHEMES[name])
+			win:_syncSettings()
+			S.status:Set("Theme: " .. name)
+		end
+	end)
+	local pickerDefs = {
+		{ "SchemeColor", "Accent colour" },
+		{ "Background", "Window background" },
+		{ "Header", "Header & sidebar" },
+		{ "ElementColor", "Buttons & rows" },
+		{ "TextColor", "Text colour" },
+	}
+	for _, def in ipairs(pickerDefs) do
+		S.pickers[def[1]] = host:ColorPicker(def[2], win._scheme[def[1]], function(c)
+			if not S.syncing then
+				Library._recolor(win, { [def[1]] = c })
+			end
+		end)
+	end
+	host:Button("Reset colours", function()
+		Library._recolor(win, win._baseScheme)
+		win:_syncSettings()
+		S.status:Set("Colours reset")
+	end)
+
+	host:Section("Presets")
+	S.status = host:Label("Save your look as a preset, or paste a preset code below.")
+	local nameBox = ""
+	S.nameInput = host:Input("Preset name", "e.g. Night mode", function(text)
+		nameBox = text
+	end, { FireOnBlur = true })
+	local selected = nil
+	S.presetDropdown = host:Dropdown("Load preset", presets().names, function(name)
+		selected = name
+		local code = presets().codes[name]
+		local look = code and decodeLook(code)
+		if look then
+			win:_applyLook(look)
+			S.status:Set("Loaded '" .. name .. "'")
+		end
+	end)
+	function S.refreshPresets()
+		S.presetDropdown:Refresh(presets().names)
+	end
+	host:Button("Save preset", function()
+		local name = cleanPresetName(nameBox ~= "" and nameBox or S.nameInput:Get())
+		if name == "" then
+			S.status:Set("Type a preset name first.")
+			return
+		end
+		local store = presets()
+		if not store.codes[name] then
+			if #store.names >= PRESET_MAX then
+				S.status:Set("Preset limit reached (" .. PRESET_MAX .. "). Delete one first.")
+				return
+			end
+			table.insert(store.names, name)
+		end
+		store.codes[name] = encodeLook(win)
+		selected = name
+		S.refreshPresets()
+		local saved = persistPresets()
+		S.status:Set("Saved '" .. name .. "'" .. (saved and " (kept on disk)" or " (this session only: your executor has no file access)"))
+	end)
+	host:Button("Delete selected preset", function()
+		local store = presets()
+		if not selected or not store.codes[selected] then
+			S.status:Set("Pick a preset in 'Load preset' first.")
+			return
+		end
+		store.codes[selected] = nil
+		for i, n in ipairs(store.names) do
+			if n == selected then
+				table.remove(store.names, i)
+				break
+			end
+		end
+		S.status:Set("Deleted '" .. selected .. "'")
+		selected = nil
+		S.refreshPresets()
+		persistPresets()
+	end)
+	host:Button("Export look (copy code)", function()
+		local code = encodeLook(win)
+		local clip = envFn(function() return setclipboard end) or envFn(function() return toclipboard end)
+		local copied = clip ~= nil and pcall(clip, code)
+		S.codeInput:Set(code)
+		S.status:Set(copied and "Look code copied to your clipboard." or "Look code is in the box below: copy it from there.")
+	end)
+	S.codeInput = host:Input("Look code", "paste a code, press Enter", function(text)
+		local look, err = decodeLook(text)
+		if not look then
+			S.status:Set("Could not import: " .. tostring(err))
+			return
+		end
+		win:_applyLook(look)
+		S.status:Set("Imported look.")
+	end)
+
+	host:Section("Window")
+	S.keepToggle = host:Toggle("Keep window on screen", win._keepOnScreen, function(on)
+		win._keepOnScreen = on
+		if on then
+			win:_settle(win._main)
+		end
+	end, { Hotkey = false })
+	host:Button("Centre window", function()
+		tween(win._main, 0.35, { Position = UDim2.fromScale(0.5, 0.5) }, STYLE_QUART)
+	end, { Hotkey = false })
+
+	if win._buildBackgroundSettings then
+		win:_buildBackgroundSettings(host, S)
+	end
+	return S
+end
+
+-- pulls the controls in line with the live scheme (after theme / preset / reset changes)
+function Library:_syncSettings()
+	local S = self._settings
+	if not S then
+		return
+	end
+	S.syncing = true
+	for key, picker in pairs(S.pickers) do
+		picker:Set(self._scheme[key], true)
+	end
+	S.keepToggle:Set(self._keepOnScreen, true)
+	S.syncing = false
+	if self._bgSync then
+		self:_bgSync()
+	end
+end
+
+function Library:SetSettingsOpen(open)
+	open = open == true
+	if self._destroyed or self._settingsOpen == open then
+		return
+	end
+	local S = self:_buildSettings()
+	self._settingsOpen = open
+	self:_hideTip()
+	S.token = (S.token or 0) + 1
+	local token = S.token
+	if open then
+		S.panel.Visible = true
+		S.page.Position = UDim2.fromOffset(0, 14)
+		tween(S.panel, PAGE_IN, { GroupTransparency = 0 }, STYLE_QUART)
+		tween(S.page, PAGE_IN, { Position = UDim2.fromOffset(0, 0) }, STYLE_QUART)
+	else
+		tween(S.panel, PAGE_OUT, { GroupTransparency = 1 })
+		tween(S.page, PAGE_OUT, { Position = UDim2.fromOffset(0, 8) })
+		task.delay(PAGE_OUT, function()
+			if not self._destroyed and S.token == token and not self._settingsOpen then
+				S.panel.Visible = false
+			end
+		end)
+	end
+	if self._gear then
+		tween(self._gear, 0.2, { TextColor3 = open and self.Theme.Accent or self.Theme.Muted })
+	end
+end
+
+function Library:ToggleSettings()
+	self:SetSettingsOpen(not self._settingsOpen)
 end
 
 ----------------------------------------------------------------------
@@ -3611,6 +4065,54 @@ function Library.ToggleUI(self)
 	end
 end
 
+-- Re-colours a live window to `newScheme` in one pass. Instances are matched by their current
+-- colour; the Header colour is only ever used by TopBar/Sidebar, so a theme whose Header and
+-- Element colours happen to be equal (Ocean, Sentinel) still maps each to its own new colour.
+function Library._recolor(win, newScheme)
+	local old = {}
+	for k, v in pairs(win.Theme) do
+		old[k] = v
+	end
+	for _, key in ipairs(SCHEME_KEYS) do
+		if newScheme[key] ~= nil then
+			win._scheme[key] = newScheme[key]
+		end
+	end
+	applyScheme(win.Theme, win._scheme)
+
+	local changes = {}
+	for k, newValue in pairs(win.Theme) do
+		if old[k] ~= newValue then
+			table.insert(changes, { key = k, old = old[k], new = newValue })
+		end
+	end
+	if #changes == 0 then
+		return
+	end
+	local props = { "BackgroundColor3", "TextColor3", "ScrollBarImageColor3", "PlaceholderColor3", "Color" }
+	for _, d in ipairs(win.Gui:GetDescendants()) do
+		local isPanel = d.Name == "TopBar" or d.Name == "Sidebar"
+		for _, prop in ipairs(props) do
+			local ok, value = pcall(function()
+				return d[prop]
+			end)
+			if ok and value ~= nil then
+				for _, change in ipairs(changes) do
+					if value == change.old and ((change.key == "Panel") == (isPanel and prop == "BackgroundColor3")) then
+						pcall(function()
+							d[prop] = change.new
+						end)
+						break
+					end
+				end
+			end
+		end
+	end
+	if win._onRecolor then
+		win:_onRecolor()
+	end
+end
+
 -- Library:ChangeColor("SchemeColor" | "Background" | "Header" | "TextColor" | "ElementColor", Color3)
 function Library.ChangeColor(self, key, color)
 	local win = targetWindow(self)
@@ -3621,37 +4123,7 @@ function Library.ChangeColor(self, key, color)
 		warn("[NovaUI] ChangeColor: unknown key '" .. tostring(key) .. "'")
 		return
 	end
-	local old = {}
-	for k, v in pairs(win.Theme) do
-		old[k] = v
-	end
-	win._scheme[key] = color
-	applyScheme(win.Theme, win._scheme)
-
-	local changes = {}
-	for k, newValue in pairs(win.Theme) do
-		if old[k] ~= newValue then
-			table.insert(changes, { old[k], newValue })
-		end
-	end
-	local props = { "BackgroundColor3", "TextColor3", "ScrollBarImageColor3", "PlaceholderColor3", "Color" }
-	for _, d in ipairs(win.Gui:GetDescendants()) do
-		for _, prop in ipairs(props) do
-			local ok, value = pcall(function()
-				return d[prop]
-			end)
-			if ok and value ~= nil then
-				for _, change in ipairs(changes) do
-					if value == change[1] then
-						pcall(function()
-							d[prop] = change[2]
-						end)
-						break
-					end
-				end
-			end
-		end
-	end
+	Library._recolor(win, { [key] = color })
 end
 
 function KavoTab:NewSection(name)

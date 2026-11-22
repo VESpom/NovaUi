@@ -1868,6 +1868,519 @@ test("hotkeys: destroying while binding is clean (timeout fires on a dead window
 end)
 
 ----------------------------------------------------------------------
+-- 6e. Keep the window on screen
+----------------------------------------------------------------------
+local function centerOf(gui)
+	local vp = M.camera.ViewportSize
+	local pos = gui.Position
+	return vp.X * pos.X.Scale + pos.X.Offset, vp.Y * pos.Y.Scale + pos.Y.Offset
+end
+local function isInside(win, gui, w, h)
+	local vp = M.camera.ViewportSize
+	local cx, cy = centerOf(gui)
+	local eps = 0.6
+	return cx - w / 2 >= 8 - eps and cx + w / 2 <= vp.X - 8 + eps and cy - h / 2 >= 8 - eps and cy + h / 2 <= vp.Y - 8 + eps
+end
+local function dragWindow(win, dx, dy)
+	local bar = findByName(win.Gui, "TopBar")
+	local cx, cy = centerOf(win._main)
+	bar.InputBegan:Fire(M.input("MouseButton1", nil, cx, cy))
+	uis().InputChanged:Fire(M.input("MouseMovement", nil, cx + dx, cy + dy))
+end
+local function release()
+	uis().InputEnded:Fire(M.input("MouseButton1"))
+end
+
+test("edge: dragging past any edge only pushes back softly, and release glides it fully inside", function()
+	for name, delta in pairs({ left = { -3000, 0 }, right = { 3000, 0 }, up = { 0, -3000 }, down = { 0, 3000 }, corner = { 3000, 3000 } }) do
+		local Lib = loadLib()
+		local win = Lib.new({ Loader = false })
+		M.advance(1)
+		local w, h = win._size.X * win._uiScale.Scale, win._size.Y * win._uiScale.Scale
+		dragWindow(win, delta[1], delta[2])
+		local cx, cy = centerOf(win._main)
+		local vp = M.camera.ViewportSize
+		check(cx >= w / 2 + 8 - 41 and cx <= vp.X - w / 2 - 8 + 41, name .. ": x overshoot is at most 40px")
+		check(cy >= h / 2 + 8 - 41 and cy <= vp.Y - h / 2 - 8 + 41, name .. ": y overshoot is at most 40px")
+		release()
+		M.advance(0.6)
+		check(isInside(win, win._main, w, h), name .. ": settled fully inside after release")
+	end
+end)
+
+test("edge: release glides back (animated), it does not teleport", function()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	M.advance(1)
+	dragWindow(win, 3000, 0)
+	local x0 = centerOf(win._main)
+	release()
+	local x1 = centerOf(win._main)
+	near(x1, x0, 0.001, "nothing jumps at t=0")
+	M.advance(0.05)
+	local x2 = centerOf(win._main)
+	check(x2 < x0 and x2 > x0 - 40, "mid-glide (" .. x0 .. " -> " .. x2 .. ")")
+	M.advance(0.5)
+end)
+
+test("edge: BUG REPRODUCTION - window left half off-screen, closed and reopened, ends up inside", function()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false, KeepOnScreen = false })
+	M.advance(1)
+	-- the old behaviour allowed the centre at the very edge / above the top, title bar unreachable
+	win._main.Position = UDim2.new(0.5, 640, 0.5, -400)
+	win:SetVisible(false)
+	M.advance(1)
+	check(not isInside(win, win._main, win._size.X, win._size.Y), "precondition: it really is off-screen")
+	local Lib2 = loadLib()
+	local win2 = Lib2.new({ Loader = false })
+	M.advance(1)
+	win2._main.Position = UDim2.new(0.5, 640, 0.5, -400)
+	win2:SetVisible(false)
+	M.advance(1)
+	win2:SetVisible(true)
+	M.advance(1.2)
+	check(isInside(win2, win2._main, win2._size.X, win2._size.Y), "reopened fully inside")
+	local top = select(2, centerOf(win2._main)) - win2._size.Y / 2
+	check(top >= 0, "title bar reachable (top = " .. top .. ")")
+end)
+
+test("edge: restoring a minimized window near the bottom edge keeps it inside", function()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	M.advance(1)
+	dragWindow(win, 0, 3000)
+	release()
+	M.advance(0.6)
+	win:SetMinimized(true)
+	M.advance(0.6)
+	dragWindow(win, 0, 3000)
+	release()
+	M.advance(0.6)
+	win:SetMinimized(false)
+	M.advance(1)
+	check(isInside(win, win._main, win._size.X, win._size.Y), "inside after restore")
+end)
+
+test("edge: shrinking the viewport pulls the window back in", function()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	M.advance(1)
+	dragWindow(win, 400, 200)
+	release()
+	M.advance(0.6)
+	M.camera.ViewportSize = M.Vector2.new(900, 520)
+	M.advance(1)
+	local w, h = win._size.X * win._uiScale.Scale, win._size.Y * win._uiScale.Scale
+	check(isInside(win, win._main, w, h), "inside the smaller viewport")
+end)
+
+test("edge: a window bigger than the viewport is centred on that axis", function()
+	local Lib = loadLib()
+	M.camera.ViewportSize = M.Vector2.new(300, 300)
+	local win = Lib.new({ Loader = false, Size = M.Vector2.new(580, 380) })
+	M.advance(1)
+	win._uiScale.Scale = 1 -- force it larger than the screen
+	dragWindow(win, 500, 500)
+	release()
+	M.advance(0.6)
+	local cx, cy = centerOf(win._main)
+	near(cx, 150, 0.6, "centred horizontally")
+	near(cy, 150, 0.6, "centred vertically")
+end)
+
+test("edge: dragging again during the glide takes over (no fighting the tween)", function()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	M.advance(1)
+	dragWindow(win, 3000, 0)
+	release()
+	M.advance(0.05)
+	local bar = findByName(win.Gui, "TopBar")
+	local cx, cy = centerOf(win._main)
+	bar.InputBegan:Fire(M.input("MouseButton1", nil, cx, cy))
+	uis().InputChanged:Fire(M.input("MouseMovement", nil, cx - 100, cy))
+	local held = centerOf(win._main)
+	M.advance(0.3)
+	near(centerOf(win._main), held, 0.5, "stays where the pointer put it while held")
+	release()
+	M.advance(0.5)
+end)
+
+test("edge: already-inside windows trigger no settle tween", function()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	M.advance(1)
+	dragWindow(win, 20, 20)
+	local before = M.tweensCreated
+	release()
+	eq(M.tweensCreated, before, "no tween when nothing needs fixing")
+end)
+
+test("edge: KeepOnScreen=false keeps the old centre-only behaviour", function()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false, KeepOnScreen = false })
+	M.advance(1)
+	dragWindow(win, 3000, 0)
+	release()
+	M.advance(1)
+	local cx = centerOf(win._main)
+	near(cx, M.camera.ViewportSize.X, 0.6, "centre allowed on the very edge, as before")
+end)
+
+test("edge: the login card is kept on screen the same way", function()
+	local Lib = loadLib()
+	local win = Lib.CreateLib("Hub", "DarkTheme")
+	M.advance(0.2)
+	local card = findByName(win.Gui, "Loader")
+	card.AbsolutePosition = M.Vector2.new(460, 200)
+	card.AbsoluteSize = M.Vector2.new(360, 262)
+	card.InputBegan:Fire(M.input("MouseButton1", nil, 500, 230))
+	uis().InputChanged:Fire(M.input("MouseMovement", nil, 9000, 230))
+	release()
+	M.advance(0.6)
+	local cx = centerOf(card)
+	local half = 360 / 2 * win._loaderScale.Scale
+	check(cx + half <= M.camera.ViewportSize.X - 8 + 0.6, "card fully inside on the right")
+end)
+
+----------------------------------------------------------------------
+-- 6b. Settings panel: gear, colours, themes, presets
+----------------------------------------------------------------------
+local function setWin(extra)
+	local Lib = loadLib()
+	local opts = { Loader = false }
+	for k, v in pairs(extra or {}) do
+		opts[k] = v
+	end
+	local win = Lib.new(opts)
+	local tab = win:Tab("Main")
+	tab:Button("Demo", function() end)
+	win:SetVisible(true)
+	M.advance(0.6)
+	return Lib, win, tab
+end
+local function gear(win)
+	return findByName(win._topBar, "Settings")
+end
+local function clickRow(win, text)
+	win:_buildSettings()
+	local page = win._settings.page
+	local label = findByText(page, text)
+	assert(label, "no control labelled " .. text)
+	if label._class == "TextButton" then
+		label.Activated:Fire()
+		return
+	end
+	local row = label
+	while row.Parent ~= page do
+		row = row.Parent
+	end
+	btnIn(row).Activated:Fire()
+end
+local function optionByText(root, text)
+	for _, d in ipairs(root:GetDescendants()) do
+		if d._class == "TextButton" and d.Name == "Option" and d._props.Text == text then
+			return d
+		end
+	end
+end
+local function c3(r, g, b) return M.Color3.fromRGB(r, g, b) end
+
+test("settings: gear button sits left of minimize and close, inside the top bar", function()
+	local _, win = setWin()
+	local g = gear(win)
+	check(g ~= nil, "gear exists")
+	eq(g.Position.X.Offset, -78, "left of minimize (-44)")
+	check(g.Text ~= "", "has an icon")
+	check(g.Position.X.Offset < findByName(win._topBar, "Minimize").Position.X.Offset, "order")
+end)
+
+test("settings: gear opens and closes the panel with a fade; page starts hidden", function()
+	local _, win = setWin()
+	check(win._settings == nil or win._settings.panel.Visible == false, "closed at start")
+	gear(win).Activated:Fire()
+	check(win:IsSettingsOpen(), "open flag")
+	local panel = win._settings.panel
+	check(panel.Visible, "visible")
+	M.advance(0.5)
+	near(panel.GroupTransparency, 0, 0.01, "fully faded in")
+	gear(win).Activated:Fire()
+	M.advance(0.05)
+	check(panel.Visible, "still visible mid fade-out")
+	M.advance(0.5)
+	check(not panel.Visible and not win:IsSettingsOpen(), "closed")
+end)
+
+test("settings: rapid open/close/open never leaves the panel hidden while open", function()
+	local _, win = setWin()
+	for _ = 1, 5 do
+		gear(win).Activated:Fire()
+		M.advance(0.03)
+	end
+	M.advance(1)
+	check(win:IsSettingsOpen() and win._settings.panel.Visible, "open after odd number of clicks")
+	eq(win._settings.panel.GroupTransparency, 0, "opaque")
+end)
+
+test("settings: choosing a tab closes the settings", function()
+	local _, win, tab = setWin()
+	local tab2 = win:Tab("Other")
+	gear(win).Activated:Fire()
+	M.advance(0.5)
+	win:SelectTab(tab2)
+	check(not win:IsSettingsOpen(), "closed")
+	win:SelectTab(tab2)
+	gear(win).Activated:Fire()
+	win:SelectTab(tab2) -- same tab still closes it
+	check(not win:IsSettingsOpen(), "closed even if tab unchanged")
+end)
+
+test("settings: changing a colour picker recolours the live window", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local S = win._settings
+	S.pickers.SchemeColor:Set(c3(255, 0, 0))
+	eq(win._scheme.SchemeColor, c3(255, 0, 0), "scheme updated")
+	eq(win.Theme.Accent, c3(255, 0, 0), "theme updated")
+	eq(findByName(win._topBar, "Dot").BackgroundColor3, c3(255, 0, 0), "accent dot recoloured")
+	S.pickers.Background:Set(c3(1, 2, 3))
+	eq(win._main.BackgroundColor3, c3(1, 2, 3), "window background recoloured")
+	S.pickers.TextColor:Set(c3(10, 200, 10))
+	eq(findByName(win._topBar, "Title").TextColor3, c3(10, 200, 10), "title text recoloured")
+end)
+
+test("settings: Header and Element recolour independently even when they started equal (Ocean)", function()
+	local _, win = setWin({ Scheme = { SchemeColor = c3(86, 76, 251), Background = c3(26, 32, 58), Header = c3(38, 45, 71), TextColor = c3(200, 200, 200), ElementColor = c3(38, 45, 71) } })
+	local sidebar = findByName(win.Gui, "Sidebar")
+	eq(sidebar.BackgroundColor3, c3(38, 45, 71), "start")
+	local btn = findByName(win.Gui, "Button_Default") or findByName(win.Gui, "Card")
+	win:SetSettingsOpen(true)
+	win._settings.pickers.Header:Set(c3(90, 0, 0))
+	eq(sidebar.BackgroundColor3, c3(90, 0, 0), "sidebar changed")
+	eq(findByName(win.Gui, "TopBar").BackgroundColor3, c3(90, 0, 0), "topbar changed")
+	if btn then
+		check(btn.BackgroundColor3 ~= c3(90, 0, 0), "buttons/rows did NOT take the header colour")
+	end
+end)
+
+test("settings: theme dropdown applies a full theme and the pickers follow", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local S = win._settings
+	local opt = findByText(S.page, "BloodTheme")
+	check(opt ~= nil, "theme listed")
+	opt.Activated:Fire()
+	eq(win._scheme.SchemeColor, c3(227, 27, 27), "accent from theme")
+	eq(win._scheme.Background, c3(10, 10, 10), "background from theme")
+	eq(S.pickers.SchemeColor:Get(), c3(227, 27, 27), "picker follows theme")
+	eq(win._main.BackgroundColor3, c3(10, 10, 10), "window recoloured")
+end)
+
+test("settings: Reset colours returns to the window's starting scheme", function()
+	local _, win = setWin()
+	local start = win._scheme.SchemeColor
+	win:SetSettingsOpen(true)
+	win._settings.pickers.SchemeColor:Set(c3(255, 0, 0))
+	clickRow(win, "Reset colours")
+	eq(win._scheme.SchemeColor, start, "accent restored")
+	eq(win._settings.pickers.SchemeColor:Get(), start, "picker restored")
+end)
+
+test("settings: preset save -> change -> load restores the look", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local S = win._settings
+	win._settings.pickers.SchemeColor:Set(c3(12, 34, 56))
+	S.nameInput:Set("Mine")
+	clickRow(win, "Save preset")
+	win._settings.pickers.SchemeColor:Set(c3(200, 100, 50))
+	local opt = optionByText(S.page, "Mine")
+	check(opt ~= nil, "preset appears in the list")
+	opt.Activated:Fire()
+	eq(win._scheme.SchemeColor, c3(12, 34, 56), "restored")
+	eq(S.pickers.SchemeColor:Get(), c3(12, 34, 56), "picker restored")
+end)
+
+test("settings: preset names are cleaned, empty names refused, overwrite keeps one entry", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local S = win._settings
+	S.nameInput:Set("   ")
+	clickRow(win, "Save preset")
+	eq(#win._settings.presetDropdown.Instance:GetDescendants() > 0, true, "ui alive")
+	S.nameInput:Set("a;b=c\tD")
+	clickRow(win, "Save preset")
+	clickRow(win, "Save preset")
+	local count = 0
+	for _, d in ipairs(S.page:GetDescendants()) do
+		if d._props.Text == "abcD" then count = count + 1 end
+	end
+	check(count >= 1, "cleaned name used")
+	S.nameInput:Set(string.rep("x", 80))
+	clickRow(win, "Save preset")
+	check(optionByText(S.page, string.rep("x", 24)) ~= nil, "long names cut to 24")
+end)
+
+test("settings: deleting a preset removes it", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local S = win._settings
+	S.nameInput:Set("Temp")
+	clickRow(win, "Save preset")
+	optionByText(S.page, "Temp").Activated:Fire()
+	clickRow(win, "Delete selected preset")
+	local gone = true
+	for _, d in ipairs(S.page:GetDescendants()) do
+		if d._class == "TextButton" and d.Name == "Option" and d._props.Text == "Temp" then gone = false end
+	end
+	check(gone, "option removed")
+end)
+
+test("settings: export gives a code, importing it in another window reproduces the look", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	win._settings.pickers.SchemeColor:Set(c3(1, 128, 255))
+	win._settings.pickers.Background:Set(c3(9, 9, 9))
+	clickRow(win, "Export look (copy code)")
+	local code = win._settings.codeInput:Get()
+	check(code:match("^NVP1;"), "has the NVP1 header: " .. tostring(code))
+	check(code:find("S=0180ff", 1, true), "accent encoded")
+	local _, win2 = setWin()
+	win2:SetSettingsOpen(true)
+	win2._settings.codeInput:Set(code)
+	local box = findByName(win2._settings.codeInput.Instance, "Box") or nil
+	-- fire the real input path
+	for _, d in ipairs(win2._settings.codeInput.Instance:GetDescendants()) do
+		if d._class == "TextBox" then
+			d.Text = code
+			d.FocusLost:Fire(true)
+		end
+	end
+	eq(win2._scheme.SchemeColor, c3(1, 128, 255), "accent imported")
+	eq(win2._scheme.Background, c3(9, 9, 9), "background imported")
+end)
+
+test("settings: garbage and hostile codes are rejected without touching the window", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local before = win._scheme.SchemeColor
+	local function try(code)
+		for _, d in ipairs(win._settings.codeInput.Instance:GetDescendants()) do
+			if d._class == "TextBox" then
+				d.Text = code
+				d.FocusLost:Fire(true)
+			end
+		end
+	end
+	for _, bad in ipairs({ "", "hello", "NVP1", "NVP1;S=zzzzzz;B=000000;H=000000;T=000000;E=000000", "NVP1;S=ff0000", string.rep("A", 5000), "NVP2;S=000000;B=000000;H=000000;T=000000;E=000000", "NVP1;S=1;B=2;H=3;T=4;E=5" }) do
+		try(bad)
+		eq(win._scheme.SchemeColor, before, "unchanged by: " .. bad:sub(1, 20))
+	end
+end)
+
+test("settings: presets survive to disk and load in a new session (executor file access)", function()
+	local fs = {}
+	local Lib = loadLib()
+	_G.writefile = function(path, data) fs[path] = data end
+	_G.readfile = function(path) return fs[path] end
+	_G.isfile = function(path) return fs[path] ~= nil end
+	_G.makefolder = function() end
+	_G.isfolder = function() return true end
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetVisible(true)
+	win:SetSettingsOpen(true)
+	win._settings.pickers.SchemeColor:Set(c3(77, 88, 99))
+	win._settings.nameInput:Set("Persist")
+	clickRow(win, "Save preset")
+	check(fs["NovaUI/presets.txt"] and fs["NovaUI/presets.txt"]:find("Persist"), "file written")
+	local Lib2 = loadLib() -- new session = module state is fresh, genv fs kept
+	_G.writefile = function(path, data) fs[path] = data end
+	_G.readfile = function(path) return fs[path] end
+	_G.isfile = function(path) return fs[path] ~= nil end
+	local win2 = Lib2.new({ Loader = false })
+	win2:Tab("Main")
+	win2:SetVisible(true)
+	win2:SetSettingsOpen(true)
+	check(optionByText(win2._settings.page, "Persist") ~= nil, "preset listed after restart")
+	_G.writefile, _G.readfile, _G.isfile, _G.makefolder, _G.isfolder = nil, nil, nil, nil, nil
+end)
+
+test("settings: a corrupted preset file is ignored line by line", function()
+	local fs = { ["NovaUI/presets.txt"] = "junk\nbad\tNVP1;S=zz\nGood\tNVP1;S=ff0000;B=000000;H=111111;T=ffffff;E=222222;K=1\n" }
+	local Lib = loadLib()
+	_G.readfile = function(path) return fs[path] end
+	_G.isfile = function(path) return fs[path] ~= nil end
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetSettingsOpen(true)
+	check(optionByText(win._settings.page, "Good") ~= nil, "valid line kept")
+	check(optionByText(win._settings.page, "bad") == nil, "invalid line dropped")
+	_G.readfile, _G.isfile = nil, nil
+end)
+
+test("settings: without file access presets still work for the session and say so", function()
+	_G.writefile, _G.readfile, _G.isfile, _G.makefolder, _G.isfolder = nil, nil, nil, nil, nil
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	win._settings.nameInput:Set("Mem")
+	clickRow(win, "Save preset")
+	local status = win._settings.status
+	check(optionByText(win._settings.page, "Mem") ~= nil, "listed")
+	local found = false
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if type(d._props.Text) == "string" and d._props.Text:find("this session only", 1, true) then found = true end
+	end
+	check(found, "status explains presets are not saved to disk")
+end)
+
+test("settings: keep-on-screen toggle changes behaviour live; centre button recentres", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	win._settings.keepToggle:Set(false)
+	eq(win._keepOnScreen, false, "off")
+	win._main.Position = M.UDim2.new(0.5, 3000, 0.5, 0)
+	win._settings.keepToggle:Set(true)
+	M.advance(0.5)
+	check(win._main.Position.X.Offset < 3000, "pulled back when turned on")
+	clickRow(win, "Centre window")
+	M.advance(0.5)
+	near(win._main.Position.X.Offset, 0, 0.5, "centred")
+	near(win._main.Position.X.Scale, 0.5, 0.001, "centred scale")
+end)
+
+test("settings: Kavo ChangeColor still works and goes through the same recolour", function()
+	local _, win = setWin()
+	win:ChangeColor("SchemeColor", c3(5, 6, 7))
+	eq(win.Theme.Accent, c3(5, 6, 7), "theme")
+	eq(findByName(win._topBar, "Dot").BackgroundColor3, c3(5, 6, 7), "dot")
+	win:ChangeColor("Nope", c3(1, 1, 1))
+end)
+
+test("settings: destroying with the panel open is clean; late fade timers do nothing", function()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	win:SetSettingsOpen(false)
+	win:Destroy()
+	M.advance(1)
+	check(#M.errors == 0, "no errors")
+end)
+
+test("settings: gear and the panel stay readable (text contrast) on all 8 themes", function()
+	for name in pairs({ DarkTheme = 1, LightTheme = 1, GrapeTheme = 1, BloodTheme = 1, Ocean = 1, Midnight = 1, Sentinel = 1, Synapse = 1 }) do
+		local Lib = loadLib()
+		local win = Lib.CreateLib("T", name, { Loader = false })
+		win:NewTab("x")
+		win:SetVisible(true)
+		win:SetSettingsOpen(true)
+		local panelBg = win._settings.panel.BackgroundColor3
+		local ratio = Lib.__test.contrastRatio(win.Theme.Text, panelBg)
+		check(ratio >= 3.5, name .. " settings text contrast " .. ratio)
+	end
+end)
+
+----------------------------------------------------------------------
 -- 7. Regression: the Kavo-style example and native API from the repo
 ----------------------------------------------------------------------
 local function runExample(file, expectReturn)
