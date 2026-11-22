@@ -15,6 +15,12 @@
 	          Window:SelectTab("Main")     -- jump to a tab from any button
 	          Window:Destroy()
 
+	Hotkeys: every button and toggle gets a small box on its right. Click it, press a key to bind;
+	          Esc or any mouse click cancels, Backspace/Delete clears, a taken key flashes "Taken".
+	          Opts: { Hotkey = Enum.KeyCode.F } default key, { Hotkey = false } no hotkey, OnHotkeyChanged = fn(key|nil);
+	          window option { Hotkeys = false } hides all boxes. obj:SetHotkey(key|nil), obj:GetHotkey(),
+	          Window:GetHotkeys() / Window:SetHotkeys(map) to save and restore.
+
 	Login image (optional): { Image = 1234567890 } or { Image = "rbxassetid://1234567890" } or { Image = "https://host/logo.png" }
 	          Links need an executor with writefile + getcustomasset; PNG or JPEG only, up to 8 MB. If it can't load,
 	          the letter logo stays and a warning is printed.
@@ -900,6 +906,182 @@ function Library:_connect(signal, fn)
 	local conn = signal:Connect(fn)
 	table.insert(self._conns, conn)
 	return conn
+end
+
+----------------------------------------------------------------------
+-- Hotkeys: ONE registry and ONE "press a key to bind" capture shared by every hotkey box
+-- and Keybind element. While capturing, nothing else reacts to the input (so RightShift
+-- cannot hide the window mid-bind), Esc / any mouse click cancels, Backspace / Delete clears,
+-- and the click that cancelled is swallowed so it cannot press whatever is underneath.
+----------------------------------------------------------------------
+
+local CAPTURE_TIMEOUT = 8
+
+local function isKeyCode(k)
+	local ok, result = pcall(function()
+		return typeof(k) == "EnumItem" and k.EnumType == Enum.KeyCode
+	end)
+	return ok and result == true
+end
+
+function Library:_clicksSwallowed()
+	if self._swallowArmed then
+		if os.clock() - (self._swallowSince or 0) < 5 then
+			return true
+		end
+		self._swallowArmed = false -- lost release event: never stay stuck
+	end
+	return os.clock() < (self._swallowUntil or 0)
+end
+
+-- Like _connect, for click handlers: ignored while a cancelled-binding click is still pending.
+function Library:_connectClick(signal, fn)
+	return self:_connect(signal, function(...)
+		if self:_clicksSwallowed() then
+			return
+		end
+		fn(...)
+	end)
+end
+
+function Library:_addHotkey(hk)
+	table.insert(self._hotkeys, hk)
+end
+
+function Library:_hotkeyId(base)
+	local n = (self._hotkeyIds[base] or 0) + 1
+	self._hotkeyIds[base] = n
+	return n == 1 and base or (base .. " #" .. n)
+end
+
+function Library:_keyTaken(code, except)
+	if code == self._toggleKey then
+		return true
+	end
+	for _, hk in ipairs(self._hotkeys) do
+		if hk ~= except and hk.key == code then
+			return true
+		end
+	end
+	return false
+end
+
+-- onDone(result, key): "bound" (key) | "cleared" | "cancelled" | "taken" (key). check(code) -> true if allowed.
+function Library:_beginCapture(onDone, check)
+	self:_endCapture("cancelled") -- only one capture at a time
+	local token = (self._captureToken or 0) + 1
+	self._captureToken = token
+	self._capture = { done = onDone, check = check }
+	task.delay(CAPTURE_TIMEOUT, function()
+		if not self._destroyed and self._captureToken == token and self._capture then
+			self:_endCapture("cancelled") -- never stay stuck on "..."
+		end
+	end)
+end
+
+function Library:_endCapture(result, key)
+	local cap = self._capture
+	if not cap then
+		return
+	end
+	self._capture = nil
+	self._captureToken = (self._captureToken or 0) + 1
+	cap.done(result, key)
+end
+
+function Library:_inputConsumed(input)
+	return self._consumedInput == input
+end
+
+function Library:_onInput(input, processed)
+	local UIT = Enum.UserInputType
+	local cap = self._capture
+	if cap then
+		self._consumedInput = input
+		local t = input.UserInputType
+		if t == UIT.MouseButton1 or t == UIT.Touch then
+			self._swallowArmed = true
+			self._swallowSince = os.clock()
+			self:_endCapture("cancelled")
+		elseif t == UIT.MouseButton2 or t == UIT.MouseButton3 then
+			self:_endCapture("cancelled")
+		elseif t == UIT.Keyboard then
+			local code = input.KeyCode
+			if code == Enum.KeyCode.Escape then
+				self:_endCapture("cancelled")
+			elseif code == Enum.KeyCode.Backspace or code == Enum.KeyCode.Delete then
+				self:_endCapture("cleared")
+			elseif code == Enum.KeyCode.Unknown then
+				return -- keep waiting
+			elseif cap.check and not cap.check(code) then
+				self:_endCapture("taken", code)
+			else
+				self:_endCapture("bound", code)
+			end
+		end
+		return
+	end
+	if processed then
+		return
+	end
+	local ok, focused = pcall(function()
+		return UserInputService:GetFocusedTextBox()
+	end)
+	if ok and focused then
+		return -- typing in a text box never triggers hotkeys
+	end
+	local code = input.KeyCode
+	if code == self._toggleKey then
+		self:ToggleVisible()
+	elseif code == Enum.KeyCode.Return and self._loaderEnter then
+		self._loaderEnter() -- Return = click Enter on the Enter screen
+	end
+	if input.UserInputType == UIT.Keyboard and code ~= Enum.KeyCode.Unknown and isUnlocked(self) and not self._closing then
+		local list = {}
+		for i, hk in ipairs(self._hotkeys) do
+			list[i] = hk
+		end
+		for _, hk in ipairs(list) do
+			if hk.key == code and hk.fire then
+				safe(hk.fire)
+			end
+		end
+	end
+end
+
+-- Save / restore bindings: GetHotkeys() -> { ["Tab/Element"] = "F" }, SetHotkeys(map) (false clears one).
+function Library:GetHotkeys()
+	local out = {}
+	for _, hk in ipairs(self._hotkeys) do
+		if hk.key then
+			out[hk.id] = hk.key.Name
+		end
+	end
+	return out
+end
+
+function Library:SetHotkeys(map)
+	if type(map) ~= "table" then
+		warn("[NovaUI] SetHotkeys expects a table like { [\"Main/Fly\"] = \"F\" }")
+		return
+	end
+	for _, hk in ipairs(self._hotkeys) do
+		local want = map[hk.id]
+		if want == false then
+			hk:SetKey(nil)
+		elseif type(want) == "string" then
+			local ok, code = pcall(function()
+				return Enum.KeyCode[want]
+			end)
+			if not ok or not isKeyCode(code) then
+				warn("[NovaUI] SetHotkeys: '" .. want .. "' is not a key name (" .. hk.id .. ")")
+			elseif self:_keyTaken(code, hk) then
+				warn("[NovaUI] SetHotkeys: " .. want .. " is already used (" .. hk.id .. ")")
+			else
+				hk:SetKey(code)
+			end
+		end
+	end
 end
 
 function Library:_updateScale()
@@ -1877,6 +2059,9 @@ function Library.new(options)
 	self._opened = false
 	self.Visible = false
 	self.Minimized = false
+	self._hotkeys = {}
+	self._hotkeyIds = {}
+	self._showChips = options.Hotkeys ~= false -- Hotkeys = false hides the hotkey boxes (code-set Hotkey keys still work)
 
 	-- Optional key system. No KeySystem option = no gate, the window opens after Enter as before.
 	local keyCfg = nil
@@ -2148,14 +2333,16 @@ function Library.new(options)
 	end
 
 	local toggleKey = options.ToggleKey or Enum.KeyCode.RightShift
+	self._toggleKey = toggleKey
 	self:_connect(UserInputService.InputBegan, function(input, processed)
-		if processed then
-			return
-		end
-		if input.KeyCode == toggleKey then
-			self:ToggleVisible()
-		elseif input.KeyCode == Enum.KeyCode.Return and self._loaderEnter then
-			self._loaderEnter() -- Return = click Enter on the Enter screen
+		self:_onInput(input, processed)
+	end)
+	self:_connect(UserInputService.InputEnded, function(input)
+		local t = input.UserInputType
+		if self._swallowArmed and (t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch) then
+			-- the click that cancelled a binding is over: swallow its release, then clicks work normally again
+			self._swallowArmed = false
+			self._swallowUntil = os.clock() + 0.12
 		end
 	end)
 
@@ -2500,7 +2687,144 @@ function Tab:Label(text)
 	}
 end
 
--- opts: string style, or { Style, Icon, Tooltip }
+local CHIP_W, CHIP_H = 56, 26
+local SHORT_KEYS = {
+	One = "1", Two = "2", Three = "3", Four = "4", Five = "5", Six = "6", Seven = "7", Eight = "8", Nine = "9", Zero = "0",
+	LeftShift = "LShift", RightShift = "RShift", LeftControl = "LCtrl", RightControl = "RCtrl", LeftAlt = "LAlt",
+	RightAlt = "RAlt", Return = "Enter", Backquote = "`", Minus = "-", Equals = "=", LeftBracket = "[", RightBracket = "]",
+	Semicolon = ";", Quote = "'", Comma = ",", Period = ".", Slash = "/", BackSlash = "\\", CapsLock = "Caps",
+	Insert = "Ins", PageUp = "PgUp", PageDown = "PgDn", Space = "Space",
+}
+local function chipText(key)
+	if not key then
+		return "None"
+	end
+	return SHORT_KEYS[key.Name] or key.Name
+end
+
+-- Registers a hotkey for an element and (when chipProps is given) builds its rebind box.
+-- opts.Hotkey: Enum.KeyCode default | false = no hotkey at all. opts.OnHotkeyChanged(key|nil).
+-- Returns the hotkey record (key, SetKey) or nil when disabled.
+function Tab:_hotkey(parent, opts, fire, label, chipProps)
+	if opts.Hotkey == false then
+		return nil
+	end
+	local win = self.Window
+	local theme = win.Theme
+	local hk = { key = nil, id = win:_hotkeyId(self.Name .. "/" .. label) }
+	if opts.Hotkey ~= nil then
+		if isKeyCode(opts.Hotkey) then
+			hk.key = opts.Hotkey
+		else
+			warn("[NovaUI] Hotkey must be an Enum.KeyCode (or false for none); ignored for '" .. label .. "'")
+		end
+	end
+	local chip, chipStroke
+	local listening = false
+	local mutedText = legible(theme.Muted, theme.Background, 4.5)
+	local accentText = legible(theme.Accent, theme.Background, 4.5)
+	local badText = legible(COLOR_BAD, theme.Background, 4.5)
+
+	local function refresh()
+		if not chip then
+			return
+		end
+		chip.Text = listening and "..." or chipText(hk.key)
+		chip.TextColor3 = (listening or hk.key) and accentText or mutedText
+		tween(chipStroke, 0.15, { Transparency = listening and 0 or 0.65, Color = theme.Accent })
+	end
+
+	function hk.SetKey(_, key, silent)
+		if key ~= nil and not isKeyCode(key) then
+			warn("[NovaUI] SetHotkey expects an Enum.KeyCode or nil")
+			return false
+		end
+		hk.key = key
+		refresh()
+		if not silent and opts.OnHotkeyChanged then
+			safe(opts.OnHotkeyChanged, key)
+		end
+		return true
+	end
+
+	hk.fire = function()
+		fire()
+		if chip then
+			tween(chipStroke, 0.08, { Transparency = 0, Color = theme.AccentLight })
+			task.delay(0.2, function()
+				if not win._destroyed and not listening then
+					refresh()
+				end
+			end)
+		end
+	end
+
+	if chipProps and win._showChips then
+		chipStroke = stroke(theme.Accent, 0.65, 1)
+		chip = create("TextButton", {
+			Name = "Hotkey",
+			AnchorPoint = chipProps.AnchorPoint,
+			Position = chipProps.Position,
+			Size = UDim2.fromOffset(CHIP_W, CHIP_H),
+			BackgroundColor3 = theme.Background,
+			AutoButtonColor = false,
+			BorderSizePixel = 0,
+			Font = FONT_BOLD,
+			TextSize = 12,
+			TextColor3 = mutedText,
+			Text = chipText(hk.key),
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			ZIndex = 5,
+			Parent = parent,
+		}, { corner(6), chipStroke })
+		refresh()
+		win:_connect(chip.MouseEnter, function()
+			if not listening then
+				tween(chipStroke, 0.12, { Transparency = 0.3 })
+			end
+		end)
+		win:_connect(chip.MouseLeave, function()
+			if not listening then
+				tween(chipStroke, 0.12, { Transparency = 0.65 })
+			end
+		end)
+		win:_attachTip(chip, { Title = "Hotkey", Text = "Click, then press a key. Esc or a click cancels, Backspace clears." })
+		win:_connectClick(chip.Activated, function()
+			if listening then
+				win:_endCapture("cancelled")
+				return
+			end
+			listening = true
+			refresh()
+			win:_beginCapture(function(result, key)
+				listening = false
+				if result == "bound" then
+					hk:SetKey(key)
+				elseif result == "cleared" then
+					hk:SetKey(nil)
+				elseif result == "taken" then
+					chip.Text = "Taken"
+					chip.TextColor3 = badText
+					tween(chipStroke, 0.1, { Transparency = 0, Color = COLOR_BAD })
+					task.delay(0.9, function()
+						if not win._destroyed and not listening then
+							refresh()
+						end
+					end)
+					return
+				end
+				refresh()
+			end, function(code)
+				return not win:_keyTaken(code, hk)
+			end)
+		end)
+	end
+
+	win:_addHotkey(hk)
+	return hk
+end
+
+-- opts: string style, or { Style, Icon, Tooltip, Hotkey, OnHotkeyChanged }
 -- Styles: "Default", "Pill", "Sweep", "Push", "Glow"
 function Tab:Button(text, callback, opts)
 	if type(opts) == "string" then
@@ -2516,9 +2840,25 @@ function Tab:Button(text, callback, opts)
 	end
 	local win = self.Window
 	local row = self:_row(ROW_HEIGHT[style], "Button_" .. style)
-	local clickable, setText = builder(win, row, tostring(text), opts)
+	-- the button style is built inside a host frame so the hotkey box fits on the right
+	local host = row
+	local chipProps = nil
+	if opts.Hotkey ~= false and win._showChips then
+		host = create("Frame", {
+			Name = "ButtonHost",
+			Size = UDim2.new(1, -(CHIP_W + 8), 1, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Parent = row,
+		})
+		chipProps = { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0) }
+	end
+	local clickable, setText = builder(win, host, tostring(text), opts)
+	local hk = self:_hotkey(row, opts, function()
+		runGated(win, callback)
+	end, tostring(text), chipProps)
 
-	win:_connect(clickable.Activated, function()
+	win:_connectClick(clickable.Activated, function()
 		runGated(win, callback)
 	end)
 	win:_attachTip(clickable, opts.Tooltip)
@@ -2527,6 +2867,12 @@ function Tab:Button(text, callback, opts)
 		Instance = row,
 		SetText = function(_, newText)
 			setText(tostring(newText))
+		end,
+		SetHotkey = function(_, key)
+			return hk ~= nil and hk:SetKey(key) or false
+		end,
+		GetHotkey = function()
+			return hk and hk.key or nil
 		end,
 	}
 end
@@ -2537,6 +2883,7 @@ function Tab:Toggle(text, default, callback, opts)
 	local theme = win.Theme
 	local state = default == true
 	local row = self:_row(40, "Toggle")
+	local chipOn = opts.Hotkey ~= false and win._showChips
 	local btn = create("TextButton", {
 		Name = "Hit",
 		Size = UDim2.fromScale(1, 1),
@@ -2549,9 +2896,10 @@ function Tab:Toggle(text, default, callback, opts)
 	local nameLabel = textLabel({
 		Name = "Label",
 		Position = UDim2.fromOffset(14, 0),
-		Size = UDim2.new(1, -80, 1, 0),
+		Size = UDim2.new(1, -(80 + (chipOn and (CHIP_W + 10) or 0)), 1, 0),
 		Text = tostring(text),
 		TextColor3 = theme.Text,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 		Parent = btn,
 	})
 	local track = create("Frame", {
@@ -2603,7 +2951,17 @@ function Tab:Toggle(text, default, callback, opts)
 		return state
 	end
 
-	win:_connect(btn.Activated, function()
+	local hk = self:_hotkey(row, opts, function()
+		obj:Set(not state)
+	end, tostring(text), chipOn and { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -(12 + 42 + 10), 0.5, 0) } or nil)
+	function obj.SetHotkey(_, key)
+		return hk ~= nil and hk:SetKey(key) or false
+	end
+	function obj.GetHotkey()
+		return hk and hk.key or nil
+	end
+
+	win:_connectClick(btn.Activated, function()
 		obj:Set(not state)
 	end)
 	win:_connect(btn.MouseEnter, function()
@@ -2897,34 +3255,53 @@ function Tab:Keybind(text, default, callback, opts)
 	}, { corner(6) })
 
 	local obj = { Instance = row }
+	-- registered in the shared hotkey list: one dispatcher, no firing while typing / locked / binding
+	local hk = {
+		key = key,
+		id = win:_hotkeyId(self.Name .. "/" .. tostring(text)),
+		fire = function()
+			runGated(win, callback)
+		end,
+	}
+	function hk.SetKey(_, newKey)
+		hk.key = newKey
+		keyButton.Text = keyName(hk.key)
+		return true
+	end
+	win:_addHotkey(hk)
 	function obj.Get()
-		return key
+		return hk.key
 	end
 	function obj.Set(_, newKey)
-		key = newKey
-		keyButton.Text = keyName(key)
+		hk:SetKey(newKey)
 	end
 
-	win:_connect(keyButton.Activated, function()
-		listening = not listening
-		keyButton.Text = listening and "..." or keyName(key)
-	end)
-	win:_connect(UserInputService.InputBegan, function(input, processed)
-		if input.UserInputType ~= Enum.UserInputType.Keyboard then
-			return
-		end
+	win:_connectClick(keyButton.Activated, function()
 		if listening then
+			win:_endCapture("cancelled")
+			return
+		end
+		listening = true
+		keyButton.Text = "..."
+		win:_beginCapture(function(result, code)
 			listening = false
-			key = input.KeyCode
-			keyButton.Text = keyName(key)
-			return
-		end
-		if processed then
-			return
-		end
-		if key ~= nil and input.KeyCode == key then
-			runGated(win, callback)
-		end
+			if result == "bound" then
+				hk.key = code
+			elseif result == "cleared" then
+				hk.key = nil
+			elseif result == "taken" then
+				keyButton.Text = "Taken"
+				task.delay(0.9, function()
+					if not win._destroyed and not listening then
+						keyButton.Text = keyName(hk.key)
+					end
+				end)
+				return
+			end
+			keyButton.Text = keyName(hk.key)
+		end, function(code)
+			return not win:_keyTaken(code, hk)
+		end)
 	end)
 	win:_attachTip(card, opts.Tooltip)
 	return obj
@@ -3298,18 +3675,41 @@ function Section:UpdateSection(newTitle)
 	self._header:Set(newTitle)
 end
 
-function Section:NewButton(name, info, callback)
-	local obj = self._tab:Button(name, callback, { Tooltip = tipFor(name, info) })
+-- Optional last argument (NovaUI extra): { Hotkey = Enum.KeyCode.F | false, OnHotkeyChanged = fn }
+local function kavoOpts(name, info, extra)
+	local o = { Tooltip = tipFor(name, info) }
+	if type(extra) == "table" then
+		for k, v in pairs(extra) do
+			o[k] = v
+		end
+	end
+	return o
+end
+
+function Section:NewButton(name, info, callback, extra)
+	local obj = self._tab:Button(name, callback, kavoOpts(name, info, extra))
 	return {
 		UpdateButton = function(_, newText)
 			obj:SetText(newText)
 		end,
+		SetHotkey = function(_, key)
+			return obj:SetHotkey(key)
+		end,
+		GetHotkey = function()
+			return obj:GetHotkey()
+		end,
 	}
 end
 
-function Section:NewToggle(name, info, callback)
-	local obj = self._tab:Toggle(name, false, callback, { Tooltip = tipFor(name, info) })
+function Section:NewToggle(name, info, callback, extra)
+	local obj = self._tab:Toggle(name, false, callback, kavoOpts(name, info, extra))
 	return {
+		SetHotkey = function(_, key)
+			return obj:SetHotkey(key)
+		end,
+		GetHotkey = function()
+			return obj:GetHotkey()
+		end,
 		-- UpdateToggle(newText [, isOn]) - text only if isOn is omitted
 		UpdateToggle = function(_, newText, isOn)
 			if newText ~= nil then

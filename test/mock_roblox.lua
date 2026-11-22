@@ -127,9 +127,10 @@ end
 ----------------------------------------------------------------------
 local Enum = setmetatable({}, {
 	__index = function(t, enumName)
-		local e = setmetatable({}, {
+		local e
+		e = setmetatable({}, {
 			__index = function(t2, itemName)
-				local item = { Name = itemName, EnumType = enumName, __t = "EnumItem" }
+				local item = { Name = itemName, EnumType = e, __t = "EnumItem" }
 				rawset(t2, itemName, item)
 				return item
 			end,
@@ -683,12 +684,14 @@ function M.reset()
 	M.errors, M.warnings = {}, {}
 	M.tweensCreated = 0
 	M.genv = {}
+	M.focused = nil
 
 	local camera = Instance.new("Camera")
 	local services = {
 		TweenService = TweenService,
 		UserInputService = {
 			InputBegan = newSignal(), InputChanged = newSignal(), InputEnded = newSignal(),
+			GetFocusedTextBox = function() return M.focused end,
 		},
 		Workspace = { CurrentCamera = camera },
 		RunService = { RenderStepped = newSignal(), Heartbeat = newSignal() },
