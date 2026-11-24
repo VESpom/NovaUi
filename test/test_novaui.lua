@@ -2381,6 +2381,438 @@ test("settings: gear and the panel stay readable (text contrast) on all 8 themes
 end)
 
 ----------------------------------------------------------------------
+-- 6c. Backgrounds (video / image / pixels), glass, colour matching [beta]
+----------------------------------------------------------------------
+local function hex6(r, g, b) return string.format("%02x%02x%02x", r, g, b) end
+local function pixelsOf(w, h, fn)
+	local t = {}
+	for y = 0, h - 1 do
+		for x = 0, w - 1 do
+			t[#t + 1] = hex6(fn(x, y))
+		end
+	end
+	return { W = w, H = h, Data = table.concat(t) }
+end
+local function bgWin(extra)
+	local Lib, win, tab = setWin(extra)
+	tab:Button("Alpha", function() end)
+	tab:Toggle("Beta", false, function() end)
+	M.advance(0.3)
+	return Lib, win, tab
+end
+local function lerpC(a, b, t) return M.Color3.new(a.R + (b.R - a.R) * t, a.G + (b.G - a.G) * t, a.B + (b.B - a.B) * t) end
+local function cards(win)
+	local out = {}
+	for _, d in ipairs(win._main:GetDescendants()) do
+		if (d.Name == "Hit" or d.Name == "Card") and d._class ~= "TextLabel" then out[#out + 1] = d end
+	end
+	return out
+end
+local function clearFs() _G.writefile, _G.readfile, _G.isfile, _G.makefolder, _G.isfolder, _G.getcustomasset, _G.request = nil, nil, nil, nil, nil, nil, nil end
+
+test("background: Pixels picture renders behind the UI, below the bars, with a dim layer", function()
+	local _, win = bgWin()
+	check(win:SetBackground({ Pixels = pixelsOf(4, 2, function(x, y) return x * 60, y * 100, 40 end) }), "accepted")
+	M.advance(0.5)
+	local backdrop = findByName(win._main, "Backdrop")
+	check(backdrop ~= nil and backdrop._class == "CanvasGroup", "rounded backdrop")
+	eq(backdrop.ZIndex, 0, "behind everything")
+	check(findByName(backdrop, "BgPixels") ~= nil, "pixels drawn")
+	local scrim = findByName(backdrop, "Scrim")
+	near(scrim.BackgroundTransparency, 1 - 0.62, 0.02, "default dim")
+	check(findByName(win._main, "TopBar").ZIndex >= 1, "bar above backdrop")
+end)
+
+test("background: equal-colour pixels merge into runs (few instances)", function()
+	local _, win = bgWin()
+	win:SetBackground({ Pixels = pixelsOf(32, 32, function() return 10, 20, 30 end) })
+	local n = 0
+	for _, d in ipairs(win._main:GetDescendants()) do if d.Name == "Run" then n = n + 1 end end
+	eq(n, 32, "one run per row")
+end)
+
+test("background: video by asset id -> muted looping VideoFrame that plays", function()
+	local _, win = bgWin()
+	win:SetBackground({ Video = 123456 })
+	M.advance(0.3)
+	local v = findByName(win._main, "BgVideo")
+	check(v ~= nil, "VideoFrame exists")
+	eq(v.Video, "rbxassetid://123456", "asset")
+	eq(v.Looped, true, "loops")
+	eq(v.Volume, 0, "silent")
+	eq(v.Playing, true, "playing")
+end)
+
+test("background: video link without executor file access fails softly and says why", function()
+	clearFs()
+	local _, win = bgWin()
+	win:SetBackground({ Video = "https://example.com/a.mp4" })
+	M.advance(0.5)
+	check(findByName(win._main, "BgVideo") == nil, "no video")
+	check(win:GetBackground().Status:find("failed", 1, true), "status failed")
+	check(#M.errors == 0, "no errors")
+end)
+
+test("background: video link downloads once, validates magic bytes, caches", function()
+	local _, win = bgWin()
+	local rec = fakeExecutor("\26\69\223\163" .. string.rep("x", 100))
+	win:SetBackground({ Video = "https://example.com/clip.webm" })
+	M.advance(0.5)
+	local v = findByName(win._main, "BgVideo")
+	check(v ~= nil and v.Video:find("rbxasset://custom/NovaUI/vid_", 1, true), "plays the saved file")
+	eq(rec.gets, 1, "one download")
+	win:SetBackground({ Video = "https://example.com/clip.webm" })
+	M.advance(0.5)
+	eq(rec.gets, 1, "second time from disk cache")
+	clearExecutor()
+	local _, win2 = bgWin()
+	local rec2 = fakeExecutor("0000ftyp" .. string.rep("x", 50))
+	win2:SetBackground({ Video = "https://example.com/b" })
+	M.advance(0.5)
+	check(findByName(win2._main, "BgVideo") ~= nil, "mp4 accepted")
+	clearExecutor()
+	local _, win3 = bgWin()
+	fakeExecutor("<html>not a video</html>")
+	win3:SetBackground({ Video = "https://example.com/c" })
+	M.advance(0.5)
+	check(findByName(win3._main, "BgVideo") == nil, "html rejected")
+	clearExecutor()
+end)
+
+test("background: hostile or malformed sources are refused without errors", function()
+	local _, win = bgWin()
+	for _, bad in ipairs({ "javascript:alert(1)", "file:///etc/passwd", "ftp://x/y.mp4", "http://a b", "", -5, 1.5, "../../x" }) do
+		win:SetBackground({ Video = bad })
+		M.advance(0.2)
+		check(findByName(win._main, "BgVideo") == nil, "refused: " .. tostring(bad))
+	end
+	check(not win:SetBackground({ Pixels = { W = 2, H = 2, Data = "abc" } }), "bad pixels refused")
+	check(not win:SetBackground({}), "empty spec refused")
+	check(not win:SetBackground("plain"), "ambiguous string refused")
+	check(win:SetBackground("https://x.com/a.png") ~= nil, "extension picks the type")
+	check(#M.errors == 0, "no errors")
+end)
+
+test("background: replacing or removing while a download is pending drops the late result", function()
+	local _, win = bgWin()
+	local rec = fakeExecutor("\26\69\223\163" .. string.rep("x", 10), { wait = 1 })
+	win:SetBackground({ Video = "https://example.com/slow.webm" })
+	M.advance(0.3)
+	win:ClearBackground()
+	M.advance(2)
+	check(findByName(win._main, "BgVideo") == nil, "late video ignored after clear")
+	win:SetBackground({ Video = "https://example.com/slow2.webm" })
+	win:SetBackground({ Pixels = pixelsOf(2, 2, function() return 1, 2, 3 end) })
+	M.advance(2)
+	check(findByName(win._main, "BgVideo") == nil, "late video ignored after replace")
+	check(findByName(win._main, "BgPixels") ~= nil, "replacement stays")
+	clearExecutor()
+end)
+
+test("background: Dim and Glass are clamped; cards turn see-through and come back solid", function()
+	local _, win = bgWin()
+	win:SetBackground({ Pixels = pixelsOf(2, 2, function() return 200, 0, 0 end), Dim = 0, Glass = 5 })
+	M.advance(0.6)
+	local bg = win:GetBackground()
+	check(bg.Dim >= 0.35 - 1e-9, "dim never below minimum")
+	check(bg.Glass <= 0.40 + 1e-9, "glass never above maximum")
+	local some = 0
+	for _, c in ipairs(cards(win)) do
+		if c.BackgroundTransparency > 0.001 then some = some + 1 end
+	end
+	check(some > 0, "cards are see-through")
+	win:SetBackgroundLevels(2, nil)
+	eq(win:GetBackground().Dim, 0.95, "dim max")
+	win:ClearBackground()
+	M.advance(0.6)
+	for _, c in ipairs(cards(win)) do
+		near(c.BackgroundTransparency, 0, 0.001, "solid again")
+	end
+	near(findByName(win._main, "Scrim").BackgroundTransparency, 1, 0.001, "scrim gone")
+	check(findByName(win._main, "BgPixels") == nil, "media removed")
+	eq(win:GetBackground(), nil, "no background")
+end)
+
+test("background: text stays readable on the WORST footage on every theme, even at extreme settings", function()
+	for name in pairs({ DarkTheme = 1, LightTheme = 1, GrapeTheme = 1, BloodTheme = 1, Ocean = 1, Midnight = 1, Sentinel = 1, Synapse = 1 }) do
+		for _, lv in ipairs({ { 0, 1 }, { 0.35, 0.4 }, { 0.62, 0.2 }, { 0.95, 0 } }) do
+			local Lib = loadLib()
+			local win = Lib.CreateLib("T", name, { Loader = false })
+			win:NewTab("x")
+			win:SetVisible(true)
+			win:SetBackground({ Pixels = pixelsOf(2, 2, function() return 128, 128, 128 end), Dim = lv[1], Glass = lv[2] })
+			local bg, th = win:GetBackground(), win.Theme
+			local worst = (0.2126 * th.Text.R + 0.7152 * th.Text.G + 0.0722 * th.Text.B) > 0.5 and M.Color3.new(1, 1, 1) or M.Color3.new(0, 0, 0)
+			local card = lerpC(lerpC(worst, th.Background, bg.Dim), th.Element, 1 - bg.Glass)
+			local ratio = Lib.__test.contrastRatio(th.Text, card)
+			check(ratio >= 4.5 - 0.01, string.format("%s dim=%.2f glass=%.2f -> %.2f", name, lv[1], lv[2], ratio))
+		end
+	end
+end)
+
+test("background: rows added after the background was set also become glass", function()
+	local _, win, tab = bgWin()
+	win:SetBackground({ Pixels = pixelsOf(2, 2, function() return 9, 9, 9 end) })
+	M.advance(0.5)
+	local btn = tab:Button("Late", function() end)
+	M.advance(0.6)
+	local hit = findByName(btn.Instance, "Hit")
+	check(hit.BackgroundTransparency > 0.001, "late button is glass")
+end)
+
+test("background: recolouring the theme keeps scrim in sync and readable", function()
+	local _, win = bgWin()
+	win:SetBackground({ Pixels = pixelsOf(2, 2, function() return 9, 9, 9 end) })
+	win:ChangeColor("Background", c3(40, 0, 60))
+	eq(findByName(win._main, "Scrim").BackgroundColor3, c3(40, 0, 60), "scrim follows")
+	win:ChangeColor("TextColor", c3(250, 250, 250))
+	win:ChangeColor("ElementColor", c3(240, 240, 240)) -- would be unreadable on glass
+	check(win:GetBackground().Glass < 0.2, "glass reduced so text stays legible")
+end)
+
+test("match: Pixels background tints cards by the colour behind them, text stays readable", function()
+	local Lib, win, tab = bgWin()
+	local px = pixelsOf(2, 1, function(x) if x == 0 then return 255, 0, 0 else return 0, 0, 255 end end)
+	win:SetBackground({ Pixels = px, Match = true })
+	local main = win._main
+	main.AbsolutePosition, main.AbsoluteSize = M.Vector2.new(0, 0), M.Vector2.new(580, 380)
+	win:_matchGather()
+	local left, right
+	for _, c in ipairs(cards(win)) do
+		c.AbsoluteSize = M.Vector2.new(100, 30)
+		c.AbsolutePosition = M.Vector2.new(left == nil and 40 or 440, 100)
+		if left == nil then left = c else right = right or c end
+	end
+	check(left and right, "have two cards")
+	M.advance(0.5)
+	M.input("MouseMovement", nil, 1, 1)
+	_G.__hb = true
+	M.services.RunService.Heartbeat:Fire(0.3)
+	M.advance(0.6)
+	local l, r = left.BackgroundColor3, right.BackgroundColor3
+	check(l.R > l.B, "card over red turns reddish")
+	check(r.B > r.R, "card over blue turns bluish")
+	for _, c in ipairs({ left, right }) do
+		check(Lib.__test.contrastRatio(win.Theme.Text, c.BackgroundColor3) >= 4.5 - 0.01, "text still readable on tinted card")
+	end
+end)
+
+test("match: turning it off restores the exact theme colours", function()
+	local _, win = bgWin()
+	win:SetBackground({ Pixels = pixelsOf(2, 1, function() return 255, 0, 0 end), Match = true })
+	win._main.AbsoluteSize = M.Vector2.new(580, 380)
+	M.services.RunService.Heartbeat:Fire(0.3)
+	M.advance(0.6)
+	check(win:SetBackgroundMatch(false), "off")
+	M.advance(0.6)
+	for _, c in ipairs(cards(win)) do
+		if c.BackgroundTransparency < 1 then
+			eq(c.BackgroundColor3, win.Theme.Element, "restored")
+		end
+	end
+end)
+
+test("match: refused without a colour map (video / web image), accepted with one", function()
+	local _, win = bgWin()
+	win:SetBackground({ Video = 555 })
+	check(not win:SetBackgroundMatch(true), "no map -> refused")
+	eq(win:GetBackground().Match, false, "still off")
+	local map = { Cols = 2, Rows = 1, Interval = 1, Frames = { hex6(255, 0, 0) .. hex6(0, 255, 0), hex6(0, 0, 255) .. hex6(255, 255, 0) } }
+	win:SetBackground({ Video = 555, ColorMap = map, Match = true })
+	eq(win:GetBackground().Match, true, "on with map")
+end)
+
+test("match: a video colour map follows the video's time position", function()
+	local _, win = bgWin()
+	local map = { Cols = 1, Rows = 1, Interval = 1, Frames = { hex6(255, 0, 0), hex6(0, 255, 0) } }
+	win:SetBackground({ Video = 555, ColorMap = map, Match = true })
+	local main = win._main
+	main.AbsolutePosition, main.AbsoluteSize = M.Vector2.new(0, 0), M.Vector2.new(580, 380)
+	local c = cards(win)[1]
+	c.AbsoluteSize, c.AbsolutePosition = M.Vector2.new(100, 30), M.Vector2.new(100, 100)
+	local v = findByName(win._main, "BgVideo")
+	v.TimePosition = 0.2
+	M.services.RunService.Heartbeat:Fire(0.3); M.advance(0.5)
+	local a = c.BackgroundColor3
+	v.TimePosition = 1.2
+	M.services.RunService.Heartbeat:Fire(0.3); M.advance(0.5)
+	local b = c.BackgroundColor3
+	check(a.R > a.G and b.G > b.R, "red frame then green frame")
+end)
+
+test("match: invalid colour maps are rejected with a warning, background still shows", function()
+	local _, win = bgWin()
+	local bad = { Cols = 2, Rows = 2, Interval = 1, Frames = { "ff00ff" } }
+	check(win:SetBackground({ Video = 5, ColorMap = bad, Match = true }), "still accepted")
+	eq(win:GetBackground().HasColorMap, false, "map ignored")
+	check(warned("ColorMap"), "warned")
+	for _, b in ipairs({ { Cols = 0, Rows = 1, Frames = { "" } }, { Cols = 1, Rows = 1, Frames = { "zzzzzz" } }, { Cols = 1, Rows = 1, Interval = -1, Frames = { "ffffff" } }, { Cols = 99, Rows = 1, Frames = { string.rep("f", 594) } } }) do
+		win:SetBackground({ Video = 5, ColorMap = b })
+		eq(win:GetBackground().HasColorMap, false, "rejected")
+	end
+end)
+
+test("match: does nothing while hidden, and a destroyed window ignores late heartbeats", function()
+	local _, win = bgWin()
+	win:SetBackground({ Pixels = pixelsOf(2, 1, function() return 255, 0, 0 end), Match = true })
+	win._main.AbsoluteSize = M.Vector2.new(580, 380)
+	win:SetVisible(false)
+	M.advance(0.6)
+	M.services.RunService.Heartbeat:Fire(0.3)
+	win:Destroy()
+	M.advance(1)
+	M.services.RunService.Heartbeat:Fire(0.3)
+	check(#M.errors == 0, "clean")
+end)
+
+test("background: settings controls drive it (dim slider, remove button, status)", function()
+	local _, win = bgWin()
+	win:SetBackground({ Pixels = pixelsOf(2, 2, function() return 9, 9, 9 end) })
+	win:SetSettingsOpen(true)
+	local S = win._settings
+	check(S.bgDim ~= nil and S.bgGlass ~= nil and S.bgMatch ~= nil, "controls exist")
+	S.bgDim:Set(80)
+	near(win:GetBackground().Dim, 0.8, 0.001, "slider sets dim")
+	S.bgMatch:Set(true)
+	eq(win:GetBackground().Match, true, "match on (pixels carry colours)")
+	win:SetBackground({ Video = 9 })
+	S.bgMatch:Set(true)
+	eq(win:GetBackground().Match, false, "video without map: refused, switch snaps back")
+	clickRow(win, "Remove background")
+	eq(win:GetBackground(), nil, "removed")
+end)
+
+test("background: typing a source in settings loads it; bad input shows a message, no crash", function()
+	local _, win = bgWin()
+	win:SetSettingsOpen(true)
+	local S = win._settings
+	local function type_(text)
+		for _, d in ipairs(S.bgSource.Instance:GetDescendants()) do
+			if d._class == "TextBox" then d.Text = text; d.FocusLost:Fire(true) end
+		end
+	end
+	type_("777")
+	M.advance(0.3)
+	eq(findByName(win._main, "BgVideo").Video, "rbxassetid://777", "video from typed id")
+	type_("not a link")
+	M.advance(0.3)
+	check(findByName(win._main, "BgVideo") == nil, "replaced by failed load, no stale video")
+	check(#M.errors == 0, "no errors")
+end)
+
+test("background: presets keep the background source and levels", function()
+	local _, win = bgWin()
+	win:SetBackground({ Video = "https://x.com/a b?x=1;y=2.webm", Dim = 0.7, Glass = 0.1 })
+	local code = Lib_encode and Lib_encode(win) or nil
+	win:SetSettingsOpen(true)
+	clickRow(win, "Export look (copy code)")
+	local code = win._settings.codeInput:Get()
+	check(code:find(";G=video|", 1, true), "background in code")
+	check(not code:find(" ", 1, true) and not code:find(";y=", 1, true), "source is url-encoded")
+	local _, win2 = bgWin()
+	win2:SetSettingsOpen(true)
+	for _, d in ipairs(win2._settings.codeInput.Instance:GetDescendants()) do
+		if d._class == "TextBox" then d.Text = code; d.FocusLost:Fire(true) end
+	end
+	local g = win2:GetBackground()
+	check(g ~= nil and g.Type == "video", "background restored")
+	near(g.Dim, 0.7, 0.01, "dim restored")
+end)
+
+test("background: Background window option works at creation and with the Kavo API", function()
+	local Lib = loadLib()
+	local win = Lib.CreateLib("T", "DarkTheme", { Loader = false, Background = { Video = 42 } })
+	win:NewTab("x")
+	win:SetVisible(true)
+	M.advance(0.4)
+	check(findByName(win._main, "BgVideo") ~= nil, "created with the window")
+	check(#M.errors == 0, "clean")
+end)
+
+----------------------------------------------------------------------
+-- 6d. Image alternatives that need no downloads (Pixels, rbxthumb, fallback list) + tool fixtures
+----------------------------------------------------------------------
+local FIXDIR = (package.searchpath("mock_roblox", package.path) or ""):gsub("mock_roblox%.lua$", "") .. "fixtures/"
+local function fixture(name) return assert(load(readFile(FIXDIR .. name)))() end
+local function logoWin(img)
+	local Lib = loadLib()
+	local win = Lib.CreateLib("Hub", "DarkTheme", { Image = img })
+	M.advance(0.6)
+	return Lib, win
+end
+
+test("image alt: Pixels logo (made by the tool) shows with no executor and no download", function()
+	clearExecutor()
+	local _, win = logoWin({ Pixels = fixture("red_pixels.lua") })
+	local logo = findByName(win.Gui, "LogoPixels")
+	check(logo ~= nil and logo._class == "CanvasGroup", "pixel logo exists")
+	near(logo.GroupTransparency, 0, 0.01, "faded in")
+	check(findByName(logo, "Run") ~= nil, "drawn")
+	check(#M.errors == 0, "clean")
+end)
+
+test("image alt: bad Pixels warn and keep the letter logo", function()
+	local _, win = logoWin({ Pixels = { W = 2, H = 2, Data = "xyz" } })
+	check(findByName(win.Gui, "LogoPixels") == nil, "nothing drawn")
+	check(warned("Pixels"), "warned")
+end)
+
+test("image alt: avatar / game / group / asset thumbnails need no executor", function()
+	clearExecutor()
+	local cases = { { { User = 1 }, "AvatarHeadShot" }, { { Game = 2 }, "GameIcon" }, { { Group = 3 }, "GroupIcon" }, { { Asset = 4 }, "Asset" } }
+	for _, c in ipairs(cases) do
+		local _, win = logoWin(c[1])
+		local img = findByName(win.Gui, "LogoImage")
+		check(img.Image:find("rbxthumb://type=" .. c[2] .. "&id=", 1, true), "thumb for " .. c[2] .. ": " .. tostring(img.Image))
+	end
+	local _, bad = logoWin({ User = -5 })
+	eq(findByName(bad.Gui, "LogoImage").Image, "", "negative id refused")
+	local _, bad2 = logoWin({ User = "abc" })
+	eq(findByName(bad2.Gui, "LogoImage").Image, "", "non-number refused")
+end)
+
+test("image alt: fallback list tries each entry until one works", function()
+	clearExecutor()
+	local _, win = logoWin({ "https://example.com/dead.png", { Pixels = { W = 1, H = 1, Data = "zzzzzz" } }, 777 })
+	eq(findByName(win.Gui, "LogoImage").Image, "rbxassetid://777", "third entry used")
+	local _, none = logoWin({ "https://example.com/a.png", "nope" })
+	eq(findByName(none.Gui, "LogoImage").Image, "", "all failed: letter stays")
+	check(warned("Image"), "warned once")
+	local _, empty = logoWin({})
+	check(#M.errors == 0, "empty list is harmless")
+end)
+
+test("image alt: rbxthumb strings pass, look-alikes and injections do not", function()
+	clearExecutor()
+	local _, ok = logoWin("rbxthumb://type=Asset&id=123&w=150&h=150")
+	check(findByName(ok.Gui, "LogoImage").Image:find("rbxthumb://", 1, true), "accepted")
+	for _, bad in ipairs({ "rbxthumb://type=Asset&id=x", "rbxthumb://type=Asset&id=1 http://evil", "rbxthumb://../x", "rbxthumb://type=Asset&id=1\n" }) do
+		local _, w = logoWin(bad)
+		eq(findByName(w.Gui, "LogoImage").Image, "", "refused: " .. bad)
+	end
+end)
+
+test("image alt: background Image accepts a thumbnail, and says to use Pixels for embedded pictures", function()
+	local _, win = bgWin()
+	win:SetBackground({ Image = { Game = 9 } })
+	M.advance(0.3)
+	check(findByName(win._main, "BgImage").Image:find("GameIcon", 1, true), "thumb background")
+	win:SetBackground({ Image = { Pixels = fixture("red_pixels.lua") } })
+	M.advance(0.3)
+	check(win:GetBackground().Status:find("Pixels", 1, true), "helpful message")
+end)
+
+test("tool fixtures: tool-made pixels and colour map work as a background with matching", function()
+	local _, win = bgWin()
+	check(win:SetBackground({ Pixels = fixture("red_pixels.lua"), Match = true }), "pixels from tool")
+	eq(win:GetBackground().Match, true, "pixels carry their own colours")
+	local map = fixture("two_frame_map.lua")
+	check(win:SetBackground({ Video = 5, ColorMap = map, Match = true }), "map from tool")
+	eq(win:GetBackground().HasColorMap, true, "map accepted")
+	eq(win:GetBackground().Match, true, "matching on")
+end)
+
+----------------------------------------------------------------------
 -- 7. Regression: the Kavo-style example and native API from the repo
 ----------------------------------------------------------------------
 local function runExample(file, expectReturn)
@@ -2438,6 +2870,12 @@ test("example_keysystem.lua: locked until hello123, then builds its tabs", funct
 	submit(gui, "hello123")
 	M.advance(4)
 	check(findByText(gui, "Hello") ~= nil, "tabs/buttons built after the right key")
+end)
+
+test("example_background.lua runs and builds its tab", function()
+	runExample("example_background.lua")
+	check(#M.errors == 0, "no errors")
+	check(findByName(currentGui(), "LogoImage") ~= nil, "avatar logo slot built")
 end)
 
 test("regression: example_native.lua runs unchanged", function()

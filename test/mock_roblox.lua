@@ -434,6 +434,19 @@ local CLASSES = {
 			return d
 		end,
 	},
+	VideoFrame = {
+		props = set(join(GUI_PROPS, { "Video", "Looped", "Playing", "Volume", "TimePosition", "TimeLength", "IsLoaded" })),
+		signals = set(join(GUI_SIGNALS, { "Loaded", "DidLoop", "Ended" })),
+		defaults = function()
+			local d = guiDefaults()
+			d.Video = ""
+			d.Looped = false
+			d.Playing = false
+			d.Volume = 0.5
+			d.TimePosition = 0
+			return d
+		end,
+	},
 	TextBox = {
 		props = set(join(GUI_PROPS, TEXT_PROPS, { "PlaceholderText", "PlaceholderColor3", "ClearTextOnFocus", "TextEditable", "MultiLine" })),
 		signals = set(BOX_SIGNALS),
@@ -583,6 +596,12 @@ function methods.IsDescendantOf(self, other)
 end
 function methods.GetPropertyChangedSignal(self, prop)
 	return signalOf(self, "Changed:" .. prop)
+end
+function methods.Play(self)
+	self.Playing = true
+end
+function methods.Pause(self)
+	self.Playing = false
 end
 function methods.CaptureFocus(self)
 	self._focused = true

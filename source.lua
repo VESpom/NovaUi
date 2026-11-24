@@ -37,6 +37,7 @@
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local Library = {}
@@ -1448,6 +1449,61 @@ local function resolveImage(src, done)
 	end)
 end
 
+-- Alternatives that never touch the network or the executor's file functions:
+--   Image = { Pixels = { W, H, Data } }      a small picture embedded in the script (tools/novaui_tool.py makes it)
+--   Image = { User = 1234 }                  Roblox avatar head shot (also Game / Group / Asset = id)
+--   Image = "rbxthumb://type=..." or "rbxasset://..." strings
+--   Image = { "https://...", 12345, { Pixels = ... } }   a fallback list, tried in order
+-- done(asset) | done(nil, reason) | done(nil, nil, pixels)
+local validPixels, renderPixels
+local THUMB_KINDS = {
+	User = "AvatarHeadShot", Game = "GameIcon", Group = "GroupIcon", Asset = "Asset",
+}
+local resolveImageAny
+function resolveImageAny(src, done)
+	if type(src) == "string" and string.match(src, "^rbxthumb://type=%a+&id=%d+[%w=&_]*$") then
+		return done(src)
+	end
+	if type(src) ~= "table" then
+		return resolveImage(src, done)
+	end
+	if src.Pixels ~= nil then
+		if validPixels(src.Pixels) then
+			return done(nil, nil, src.Pixels)
+		end
+		return done(nil, "Pixels must be { W, H, Data } with W*H*6 hex digits (max 64 x 64)")
+	end
+	for key, kind in pairs(THUMB_KINDS) do
+		local id = src[key]
+		if id ~= nil then
+			id = tonumber(id)
+			if not id or id <= 0 or id ~= math.floor(id) then
+				return done(nil, key .. " must be a positive number")
+			end
+			return done(string.format("rbxthumb://type=%s&id=%d&w=150&h=150", kind, id))
+		end
+	end
+	if #src == 0 then
+		return done(nil, "empty image list")
+	end
+	-- fallback list: first one that works wins
+	local index, lastWhy = 0, "no image worked"
+	local function nextOne()
+		index = index + 1
+		if index > #src or index > 8 then
+			return done(nil, lastWhy)
+		end
+		resolveImageAny(src[index], function(asset, why, px)
+			if asset or px then
+				return done(asset, why, px)
+			end
+			lastWhy = why or lastWhy
+			nextOne()
+		end)
+	end
+	nextOne()
+end
+
 -- Filled accent button with a bold white label. The gradient lives on its own frame
 -- (a UIGradient on the button itself would tint the label too).
 -- Returns the clickable TextButton and its holder frame.
@@ -1660,8 +1716,25 @@ function Library:_buildLoader(options, keyCfg, startAtKey)
 			ZIndex = 3,
 			Parent = card,
 		}, { corner(16) })
-		resolveImage(options.Image ~= nil and options.Image or options.Logo, function(asset, why)
+		resolveImageAny(options.Image ~= nil and options.Image or options.Logo, function(asset, why, px)
 			if self._destroyed then
+				return
+			end
+			if px then
+				local holder = create("CanvasGroup", {
+					Name = "LogoPixels",
+					AnchorPoint = Vector2.new(0.5, 0),
+					Position = UDim2.new(0.5, 0, 0, 26),
+					Size = UDim2.fromOffset(56, 56),
+					BackgroundTransparency = 1,
+					BorderSizePixel = 0,
+					GroupTransparency = 1,
+					ZIndex = 3,
+					Parent = card,
+				}, { corner(16) })
+				renderPixels(holder, px)
+				tween(holder, 0.3, { GroupTransparency = 0 })
+				tween(logoLetter, 0.3, { TextTransparency = 1 })
 				return
 			end
 			if not asset then
@@ -2343,6 +2416,10 @@ function Library.new(options)
 		Parent = body,
 	})
 
+	if options.Background ~= nil then
+		self:SetBackground(options.Background)
+	end
+
 	-- tooltip ------------------------------------------------------------
 	local tip = create("CanvasGroup", {
 		Name = "Tooltip",
@@ -2705,6 +2782,9 @@ end
 
 function Tab:_row(height, name)
 	self._order = self._order + 1
+	if self.Window._bg then
+		self.Window:_bgQueueGlass() -- new rows join the glass / colour matching
+	end
 	return create("Frame", {
 		Name = name,
 		LayoutOrder = self._order,
@@ -4001,6 +4081,791 @@ end
 
 function Library:ToggleSettings()
 	self:SetSettingsOpen(not self._settingsOpen)
+end
+
+----------------------------------------------------------------------
+-- Backgrounds: a looping video / image / embedded pixel picture behind the window.
+--   * a dim layer (never lighter than BG_MIN_DIM) keeps text readable on any footage
+--   * buttons and rows become slightly see-through ("glass", at most BG_MAX_GLASS)
+--   * Match colours [beta]: rows, bars and text take on the colour of the picture behind them.
+--     Roblox cannot read pixels from a video or a web image, so this needs a colour map
+--     (made once with tools/novaui_tool.py) or a Pixels picture, which carries its own colours.
+----------------------------------------------------------------------
+
+local BG_MIN_DIM, BG_MAX_DIM, BG_DEFAULT_DIM = 0.35, 0.95, 0.62
+local BG_MAX_GLASS, BG_DEFAULT_GLASS = 0.40, 0.20
+local MATCH_STEP = 0.2 -- seconds between colour updates
+local MATCH_STRENGTHS = { 0.55, 0.45, 0.35, 0.25, 0.15, 0 }
+local MAX_VIDEO_BYTES = 40 * 1024 * 1024
+local MAX_PIXELS = 64 -- Pixels pictures: at most 64 x 64
+
+local function videoKind(data)
+	if string.sub(data, 1, 4) == "\26\69\223\163" then
+		return "webm"
+	end
+	if string.sub(data, 5, 8) == "ftyp" then
+		return "mp4"
+	end
+	return nil
+end
+
+local function urlEncode(s)
+	return (string.gsub(tostring(s), "[^%w%-%._~:/%?#@!$&'()*+,%%]", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
+end
+
+local function urlDecode(s)
+	return (string.gsub(tostring(s), "%%(%x%x)", function(h)
+		return string.char(tonumber(h, 16))
+	end))
+end
+
+-- done(asset) | done(nil, reason). Videos: rbxassetid, or an https link the executor downloads and plays from disk.
+local function resolveVideo(src, done)
+	if type(src) == "number" then
+		if src > 0 and src == math.floor(src) then
+			return done("rbxassetid://" .. string.format("%d", src))
+		end
+		return done(nil, "invalid asset id")
+	end
+	if type(src) ~= "string" or src == "" then
+		return done(nil, "Video must be an asset id or an https link")
+	end
+	if string.match(src, "^%d+$") then
+		return done("rbxassetid://" .. src)
+	end
+	if string.match(src, "^rbxassetid://%d+$") then
+		return done(src)
+	end
+	if not string.match(src, "^https?://[%w%-%._~:/%?#@!$&'()*+,;=%%]+$") or #src > 2000 then
+		return done(nil, "unsupported video source (use an asset id or an http/https link)")
+	end
+	local writeFile = envFn(function()
+		return writefile
+	end)
+	local getAsset = envFn(function()
+		return getcustomasset
+	end) or envFn(function()
+		return getsynasset
+	end)
+	if not writeFile or not getAsset then
+		return done(nil, "this executor can't play videos from links (needs writefile + getcustomasset); upload it and use an rbxassetid")
+	end
+	local isFile = envFn(function()
+		return isfile
+	end)
+	local makeFolder = envFn(function()
+		return makefolder
+	end)
+	local base = "NovaUI/vid_" .. string.sub(sha256(src), 1, 24)
+	task.spawn(function()
+		local path = nil
+		if isFile then
+			for _, ext in ipairs({ "webm", "mp4" }) do
+				local ok, exists = pcall(isFile, base .. "." .. ext)
+				if ok and exists then
+					path = base .. "." .. ext
+				end
+			end
+		end
+		if not path then
+			local data = downloadImage(src)
+			if not data then
+				return done(nil, "download failed")
+			end
+			if #data > MAX_VIDEO_BYTES then
+				return done(nil, "video too large (max 40 MB)")
+			end
+			local kind = videoKind(data)
+			if not kind then
+				return done(nil, "not a .webm or .mp4 video")
+			end
+			if makeFolder then
+				pcall(makeFolder, "NovaUI")
+			end
+			path = base .. "." .. kind
+			if not pcall(writeFile, path, data) then
+				return done(nil, "could not save the video")
+			end
+		end
+		local ok, asset = pcall(getAsset, path)
+		if ok and type(asset) == "string" and asset ~= "" then
+			done(asset)
+		else
+			done(nil, "could not load the video")
+		end
+	end)
+end
+
+-- A colour map is { Cols, Rows, Interval, Frames = { "rrggbb" x Cols*Rows, ... } } (row-major).
+local function validMap(map)
+	if type(map) ~= "table" then
+		return false
+	end
+	local cols, rows, frames = map.Cols, map.Rows, map.Frames
+	if type(cols) ~= "number" or type(rows) ~= "number" or cols ~= math.floor(cols) or rows ~= math.floor(rows) then
+		return false
+	end
+	if cols < 1 or rows < 1 or cols > MAX_PIXELS or rows > MAX_PIXELS or type(frames) ~= "table" or #frames < 1 or #frames > 4000 then
+		return false
+	end
+	if map.Interval ~= nil and (type(map.Interval) ~= "number" or map.Interval <= 0) then
+		return false
+	end
+	for _, f in ipairs(frames) do
+		if type(f) ~= "string" or #f ~= cols * rows * 6 or string.find(f, "%X") then
+			return false
+		end
+	end
+	return true
+end
+
+-- Pixels = { W, H, Data = "rrggbb..." } (row-major). Doubles as a one-frame colour map.
+function validPixels(px)
+	if type(px) ~= "table" or type(px.W) ~= "number" or type(px.H) ~= "number" or type(px.Data) ~= "string" then
+		return false
+	end
+	if px.W ~= math.floor(px.W) or px.H ~= math.floor(px.H) or px.W < 1 or px.H < 1 or px.W > MAX_PIXELS or px.H > MAX_PIXELS then
+		return false
+	end
+	return #px.Data == px.W * px.H * 6 and not string.find(px.Data, "%X")
+end
+
+local function mapCell(map, frame, u, v)
+	local col = clamp(math.floor(u * map.Cols), 0, map.Cols - 1)
+	local row = clamp(math.floor(v * map.Rows), 0, map.Rows - 1)
+	local at = (row * map.Cols + col) * 6 + 1
+	return fromHex(string.sub(map.Frames[frame], at, at + 5))
+end
+
+-- Draws a Pixels picture as horizontal runs of equal colour (far fewer Frames than one per pixel).
+function renderPixels(parent, px)
+	local holder = create("Frame", {
+		Name = "BgPixels",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = parent,
+	})
+	for y = 0, px.H - 1 do
+		local x = 0
+		while x < px.W do
+			local at = (y * px.W + x) * 6 + 1
+			local hex = string.sub(px.Data, at, at + 5)
+			local run = 1
+			while x + run < px.W and string.sub(px.Data, at + run * 6, at + run * 6 + 5) == hex do
+				run = run + 1
+			end
+			create("Frame", {
+				Name = "Run",
+				Position = UDim2.new(x / px.W, 0, y / px.H, 0),
+				Size = UDim2.new(run / px.W, 1, 1 / px.H, 1),
+				BackgroundColor3 = fromHex(hex),
+				BorderSizePixel = 0,
+				Parent = holder,
+			})
+			x = x + run
+		end
+	end
+	return holder
+end
+
+-- worst-case contrast the text can have on a glass card over the dimmed picture
+-- (the picture is assumed to be the colour that is hardest for the text)
+local function worstCardContrast(theme, dim, glass)
+	local worstMedia = luminance(theme.Text) > 0.5 and WHITE or BLACK
+	worstMedia = luminance(theme.Text) > 0.5 and WHITE or BLACK
+	local scrimmed = mix(worstMedia, theme.Background, dim)
+	local card = mix(scrimmed, theme.Element, 1 - glass)
+	return contrastRatio(theme.Text, card)
+end
+
+local function clampLevels(theme, dim, glass)
+	dim = clamp(tonumber(dim) or BG_DEFAULT_DIM, BG_MIN_DIM, BG_MAX_DIM)
+	glass = clamp(tonumber(glass) or BG_DEFAULT_GLASS, 0, BG_MAX_GLASS)
+	-- if the choice could make card text hard to read on the worst footage, make the cards more solid
+	while glass > 0 and worstCardContrast(theme, dim, glass) < 4.5 do
+		glass = math.max(0, glass - 0.05)
+	end
+	return dim, glass
+end
+
+local GLASS_KINDS = { "Element", "ElementHover", "Background" }
+
+function Library:_bgQueueGlass()
+	local bg = self._bg
+	if not bg or self._bgGlassQueued or self._destroyed then
+		return
+	end
+	self._bgGlassQueued = true
+	task.defer(function()
+		self._bgGlassQueued = false
+		if not self._destroyed and self._bg then
+			self:_bgApplyGlass(0.2)
+			if self._bg.match then
+				self:_matchGather()
+			end
+		end
+	end)
+end
+
+-- makes cards, bars and rows see-through (or solid again when no background)
+function Library:_bgApplyGlass(duration)
+	local bg = self._bg
+	local theme = self.Theme
+	local glass = bg and bg.glassUsed or 0
+	local seen = self._glassed
+	for _, d in ipairs(self._main:GetDescendants()) do
+		if d.Name ~= "Scrim" and (d._class == "Frame" or d._class == "TextButton" or d._class == "CanvasGroup" or d._class == "ScrollingFrame") then
+			local inBackdrop = self._backdrop ~= nil and d:IsDescendantOf(self._backdrop)
+			if not inBackdrop and d ~= self._main then
+				local isBar = d.Name == "TopBar" or d.Name == "Sidebar"
+				local c = d.BackgroundColor3
+				local eligible = isBar or c == theme.Element or c == theme.ElementHover or d.Name == "SettingsPanel"
+					or (d.Name == "Option" and c == theme.Background)
+				if d.BackgroundTransparency == 0 or seen[d] then
+					if eligible or seen[d] then
+						if eligible and not seen[d] and bg then
+							seen[d] = true
+						end
+						if seen[d] then
+							local t = glass
+							if isBar then
+								t = glass * 0.7 -- bars carry the title and tabs: keep them a bit more solid
+							end
+							if d._class == "TextButton" and d.Name == "Tab" then
+								t = 1
+							end
+							tween(d, duration or 0, { BackgroundTransparency = t })
+							if not bg then
+								seen[d] = nil
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function ensureBackdrop(win)
+	if win._backdrop then
+		return win._backdrop
+	end
+	local theme = win.Theme
+	win._backdrop = create("CanvasGroup", {
+		Name = "Backdrop",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 0,
+		Parent = win._main,
+	}, { corner(14) })
+	win._scrim = create("Frame", {
+		Name = "Scrim",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = theme.Background,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = win._backdrop,
+	})
+	return win._backdrop
+end
+
+local function clearMedia(win)
+	if win._bgMedia then
+		win._bgMedia:Destroy()
+		win._bgMedia = nil
+		win._bgVideo = nil
+	end
+end
+
+-- Colour matching ---------------------------------------------------------
+
+function Library:_matchGather()
+	local theme = self.Theme
+	local recs = self._matchRecs
+	for _, d in ipairs(self._main:GetDescendants()) do
+		if not recs[d] and not (self._backdrop and d:IsDescendantOf(self._backdrop)) then
+			local cls = d._class
+			if cls == "Frame" or cls == "TextButton" or cls == "CanvasGroup" then
+				local isBar = d.Name == "TopBar" or d.Name == "Sidebar"
+				if d.BackgroundTransparency < 1 then
+					if isBar and d.BackgroundColor3 == theme.Panel then
+						recs[d] = { kind = "Panel", last = d.BackgroundColor3 }
+					elseif d.BackgroundColor3 == theme.Element and d.Name ~= "Track" then
+						recs[d] = { kind = "Element", last = d.BackgroundColor3 }
+					end
+				end
+			end
+			if (cls == "TextLabel" or cls == "TextButton" or cls == "TextBox") and d.TextColor3 == theme.Text then
+				recs[d] = { kind = "Text", last = d.TextColor3 }
+			end
+		end
+	end
+end
+
+function Library:_matchRestore()
+	local theme = self.Theme
+	for inst, rec in pairs(self._matchRecs) do
+		if inst.Parent ~= nil then
+			if rec.kind == "Text" then
+				tween(inst, 0.25, { TextColor3 = theme.Text })
+			else
+				tween(inst, 0.25, { BackgroundColor3 = rec.kind == "Panel" and theme.Panel or theme.Element })
+			end
+		end
+	end
+	self._matchRecs = setmetatable({}, { __mode = "k" })
+end
+
+local function backgroundBehind(inst, main)
+	local p = inst.Parent
+	while p and p ~= main do
+		if p.BackgroundTransparency ~= nil and p.BackgroundTransparency < 0.5 and p.Name ~= "Backdrop" then
+			return p
+		end
+		p = p.Parent
+	end
+	return nil
+end
+
+function Library:_matchStep()
+	local bg = self._bg
+	if not (bg and bg.match and bg.map and self._backdrop) or self._destroyed then
+		return
+	end
+	local map = bg.map
+	local frame = 1
+	if self._bgVideo and #map.Frames > 1 then
+		local tp = self._bgVideo.TimePosition
+		if type(tp) == "number" then
+			frame = math.floor(tp / (map.Interval or 0.5)) % #map.Frames + 1
+		end
+	end
+	local theme = self.Theme
+	local main = self._main
+	local mp, ms = main.AbsolutePosition, main.AbsoluteSize
+	if ms.X <= 0 or ms.Y <= 0 then
+		return
+	end
+	local tinted = {}
+	for inst, rec in pairs(self._matchRecs) do
+		if inst.Parent == nil then
+			self._matchRecs[inst] = nil
+		elseif rec.kind ~= "Text" then
+			local cur = inst.BackgroundColor3
+			if cur == rec.last or cur == theme.Element or cur == theme.ElementHover or cur == theme.Panel then
+				local pos, size = inst.AbsolutePosition, inst.AbsoluteSize
+				local u = clamp((pos.X + size.X / 2 - mp.X) / ms.X, 0, 1)
+				local v = clamp((pos.Y + size.Y / 2 - mp.Y) / ms.Y, 0, 1)
+				local sample = mapCell(map, frame, u, v)
+				local base = rec.kind == "Panel" and theme.Panel or theme.Element
+				local goal = base
+				if sample then
+					for _, strength in ipairs(MATCH_STRENGTHS) do
+						goal = mix(base, sample, strength)
+						-- the text colour must still read on the tinted card
+						if strength == 0 or contrastRatio(theme.Text, goal) >= 4.5 then
+							break
+						end
+					end
+					rec.sample = sample
+				end
+				rec.last = goal
+				tinted[inst] = goal
+				tween(inst, MATCH_STEP, { BackgroundColor3 = goal })
+			end
+		end
+	end
+	for inst, rec in pairs(self._matchRecs) do
+		if rec.kind == "Text" and inst.Parent ~= nil then
+			local cur = inst.TextColor3
+			if cur == rec.last or cur == theme.Text then
+				local host = backgroundBehind(inst, main)
+				local hostColor = host and (tinted[host] or host.BackgroundColor3) or theme.Background
+				local pos, size = inst.AbsolutePosition, inst.AbsoluteSize
+				local u = clamp((pos.X + size.X / 2 - mp.X) / ms.X, 0, 1)
+				local v = clamp((pos.Y + size.Y / 2 - mp.Y) / ms.Y, 0, 1)
+				local sample = mapCell(map, frame, u, v)
+				local goal = theme.Text
+				if sample then
+					goal = legible(mix(theme.Text, sample, 0.30), hostColor, 4.5)
+				end
+				rec.last = goal
+				tween(inst, MATCH_STEP, { TextColor3 = goal })
+			end
+		end
+	end
+end
+
+function Library:_matchEnable(on)
+	if on then
+		self._matchRecs = self._matchRecs or setmetatable({}, { __mode = "k" })
+		self:_matchGather()
+		if not self._matchConn then
+			local acc = 0
+			self._matchConn = self:_connect(RunService.Heartbeat, function(dt)
+				acc = acc + (tonumber(dt) or 0)
+				if acc >= MATCH_STEP then
+					acc = 0
+					if self.Visible and not self._closing then
+						self:_matchStep()
+					end
+				end
+			end)
+		end
+		self:_matchStep()
+	else
+		if self._matchRecs then
+			self:_matchRestore()
+		end
+	end
+end
+
+-- Public API ----------------------------------------------------------------
+
+-- SetBackground(nil)                          remove it
+-- SetBackground({ Video = id | link, Dim = 0.62, Glass = 0.2, Match = false, ColorMap = {...} })
+-- SetBackground({ Image = id | link, ... })   a still picture
+-- SetBackground({ Pixels = { W, H, Data }, ... })   a small embedded picture, no downloads at all
+-- A string ending in .webm/.mp4 is a Video, .png/.jpg/.jpeg an Image.
+-- Returns true when accepted. Media may still load later (asynchronously); failures never throw.
+function Library:SetBackground(spec)
+	if self._destroyed then
+		return false
+	end
+	if spec == nil or spec == false then
+		self:ClearBackground()
+		return true
+	end
+	if type(spec) == "string" or type(spec) == "number" then
+		local lower = type(spec) == "string" and string.lower(string.match(spec, "^[^%?#]*") or "") or ""
+		if string.match(lower, "%.webm$") or string.match(lower, "%.mp4$") then
+			spec = { Video = spec }
+		elseif string.match(lower, "%.png$") or string.match(lower, "%.jpe?g$") then
+			spec = { Image = spec }
+		else
+			warn("[NovaUI] SetBackground: say what it is, e.g. { Video = ... } or { Image = ... }")
+			return false
+		end
+	end
+	if type(spec) ~= "table" then
+		warn("[NovaUI] SetBackground expects a table")
+		return false
+	end
+	local kind, source
+	if spec.Video ~= nil then
+		kind, source = "video", spec.Video
+	elseif spec.Image ~= nil then
+		kind, source = "image", spec.Image
+	elseif spec.Pixels ~= nil then
+		kind, source = "pixels", spec.Pixels
+		if not validPixels(source) then
+			warn("[NovaUI] SetBackground: Pixels must be { W, H, Data } with W*H*6 hex digits (max 64 x 64)")
+			return false
+		end
+	else
+		warn("[NovaUI] SetBackground: give Video, Image or Pixels")
+		return false
+	end
+	local map = nil
+	if spec.ColorMap ~= nil then
+		if validMap(spec.ColorMap) then
+			map = spec.ColorMap
+		else
+			warn("[NovaUI] SetBackground: ColorMap is not valid, colour matching stays off")
+		end
+	elseif kind == "pixels" then
+		map = { Cols = source.W, Rows = source.H, Interval = 1, Frames = { source.Data } }
+	end
+
+	local theme = self.Theme
+	local dim, glass = clampLevels(theme, spec.Dim, spec.Glass)
+	local first = self._bg == nil
+	self._bgToken = (self._bgToken or 0) + 1
+	local token = self._bgToken
+	local state = {
+		kind = kind,
+		source = kind ~= "pixels" and source or nil,
+		dim = dim,
+		glass = glass,
+		glassUsed = glass,
+		match = spec.Match == true,
+		map = map,
+		status = "loading",
+	}
+	self._bg = state
+	self._glassed = self._glassed or setmetatable({}, { __mode = "k" })
+	self._matchRecs = self._matchRecs or setmetatable({}, { __mode = "k" })
+
+	local backdrop = ensureBackdrop(self)
+	clearMedia(self)
+	tween(self._scrim, first and 0.4 or 0.2, { BackgroundTransparency = 1 - dim })
+	self:_bgApplyGlass(first and 0.4 or 0.2)
+
+	local function show(asset)
+		if self._destroyed or self._bgToken ~= token then
+			return -- replaced or removed while loading
+		end
+		clearMedia(self)
+		if kind == "video" then
+			local v = create("VideoFrame", {
+				Name = "BgVideo",
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Video = asset,
+				Looped = true,
+				Volume = 0,
+				ZIndex = 1,
+				Parent = backdrop,
+			})
+			self._bgMedia, self._bgVideo = v, v
+			v.Playing = true
+			pcall(function()
+				v:Play()
+			end)
+		elseif kind == "image" then
+			self._bgMedia = create("ImageLabel", {
+				Name = "BgImage",
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Image = asset,
+				ScaleType = Enum.ScaleType.Crop,
+				ZIndex = 1,
+				Parent = backdrop,
+			})
+		else
+			self._bgMedia = renderPixels(backdrop, source)
+			self._bgMedia.ZIndex = 1
+		end
+		state.status = "ready"
+		state.asset = asset
+		if self._bgStatus then
+			self._bgStatus(state.status)
+		end
+		self:_bgQueueGlass()
+	end
+	local function fail(reason)
+		if self._destroyed or self._bgToken ~= token then
+			return
+		end
+		state.status = "failed: " .. tostring(reason)
+		warn("[NovaUI] background: " .. tostring(reason))
+		if self._bgStatus then
+			self._bgStatus(state.status)
+		end
+	end
+	local function handle(asset, reason)
+		if asset then
+			show(asset)
+		else
+			fail(reason)
+		end
+	end
+	if kind == "video" then
+		resolveVideo(source, handle)
+	elseif kind == "image" then
+		resolveImageAny(source, function(asset, why, px)
+			handle(asset, why or (px and "for an embedded picture use Pixels = ... instead of Image = ..." or nil))
+		end)
+	else
+		show(nil)
+	end
+
+	if state.match and state.map then
+		self:_matchEnable(true)
+	else
+		self:_matchEnable(false)
+	end
+	if self._bgSync then
+		self:_bgSync()
+	end
+	return true
+end
+
+function Library:ClearBackground()
+	if self._destroyed then
+		return
+	end
+	self._bgToken = (self._bgToken or 0) + 1
+	if self._matchRecs then
+		self:_matchRestore()
+	end
+	local had = self._bg
+	self._bg = nil
+	if had then
+		self:_bgApplyGlass(0.25)
+	end
+	if self._scrim then
+		tween(self._scrim, 0.25, { BackgroundTransparency = 1 })
+	end
+	clearMedia(self)
+	if self._bgSync then
+		self:_bgSync()
+	end
+end
+
+function Library:GetBackground()
+	local bg = self._bg
+	if not bg then
+		return nil
+	end
+	return { Type = bg.kind, Source = bg.source, Dim = bg.dim, Glass = bg.glass, Match = bg.match, HasColorMap = bg.map ~= nil, Status = bg.status }
+end
+
+-- Dim / Glass / Match can be changed live without reloading the media.
+function Library:SetBackgroundLevels(dim, glass)
+	local bg = self._bg
+	if not bg then
+		return
+	end
+	bg.dim, bg.glass = clampLevels(self.Theme, dim ~= nil and dim or bg.dim, glass ~= nil and glass or bg.glass)
+	bg.glassUsed = bg.glass
+	tween(self._scrim, 0.2, { BackgroundTransparency = 1 - bg.dim })
+	self:_bgApplyGlass(0.2)
+end
+
+function Library:SetBackgroundMatch(on)
+	local bg = self._bg
+	if not bg then
+		return false
+	end
+	on = on == true
+	if on and not bg.map then
+		return false -- nothing to read colours from
+	end
+	bg.match = on
+	self:_matchEnable(on)
+	return true
+end
+
+-- presets keep the type, source and levels (colour maps and Pixels are too big to embed)
+function Library:_bgEncode()
+	local bg = self._bg
+	if not bg or not bg.source then
+		return nil
+	end
+	return table.concat({ bg.kind, urlEncode(tostring(bg.source)), string.format("%.2f", bg.dim), string.format("%.2f", bg.glass), bg.match and "1" or "0" }, "|")
+end
+
+function Library:_bgDecode(code)
+	local kind, src, dim, glass, match = string.match(tostring(code), "^(%a+)|([^|]*)|([%d%.]+)|([%d%.]+)|([01])$")
+	if not kind or (kind ~= "video" and kind ~= "image") then
+		return false
+	end
+	local spec = { Dim = tonumber(dim), Glass = tonumber(glass), Match = match == "1" and self._bg ~= nil and self._bg.map ~= nil }
+	local source = urlDecode(src)
+	if string.match(source, "^%d+$") then
+		source = tonumber(source)
+	end
+	if kind == "video" then
+		spec.Video = source
+	else
+		spec.Image = source
+	end
+	if self._bg and self._bg.map then
+		spec.ColorMap = self._bg.map
+	end
+	return self:SetBackground(spec)
+end
+
+function Library:_onRecolor()
+	local bg = self._bg
+	if self._scrim then
+		self._scrim.BackgroundColor3 = self.Theme.Background
+	end
+	if bg then
+		bg.dim, bg.glass = clampLevels(self.Theme, bg.dim, bg.glass)
+		bg.glassUsed = bg.glass
+		self._scrim.BackgroundTransparency = 1 - bg.dim
+		self:_bgApplyGlass(0)
+		if bg.match and bg.map then
+			self:_matchGather()
+			self:_matchStep()
+		end
+	end
+end
+
+-- Settings controls ----------------------------------------------------------
+
+function Library:_buildBackgroundSettings(host, S)
+	local win = self
+	host:Section("Background  (video / image)")
+	S.bgNote = host:Label("Put a looping video or picture behind the window. Text and buttons stay readable.")
+	local kindNow = "Video"
+	S.bgType = host:Dropdown("Type", { "Video", "Image" }, function(v)
+		kindNow = v
+	end)
+	S.bgSource = host:Input("Source", "asset id or https link, press Enter", function(text)
+		text = trimText(text)
+		if text == "" then
+			return
+		end
+		local spec = { Dim = win._bg and win._bg.dim, Glass = win._bg and win._bg.glass }
+		local source = string.match(text, "^%d+$") and tonumber(text) or text
+		spec[kindNow] = source
+		if win._bg and win._bg.map then
+			spec.ColorMap = win._bg.map
+		end
+		win:SetBackground(spec)
+		S.bgNote:Set("Loading " .. string.lower(kindNow) .. "...")
+	end)
+	S.bgDim = host:Slider("Dim (readability)", math.floor(BG_MIN_DIM * 100), math.floor(BG_MAX_DIM * 100), math.floor(BG_DEFAULT_DIM * 100), function(v)
+		if not S.syncing then
+			win:SetBackgroundLevels(v / 100, nil)
+		end
+	end, { Suffix = "%" })
+	S.bgGlass = host:Slider("Glass (see-through buttons)", 0, math.floor(BG_MAX_GLASS * 100), math.floor(BG_DEFAULT_GLASS * 100), function(v)
+		if not S.syncing then
+			win:SetBackgroundLevels(nil, v / 100)
+		end
+	end, { Suffix = "%" })
+	S.bgMatch = host:Toggle("Match colours [beta]", false, function(on)
+		if S.syncing then
+			return
+		end
+		if not win:SetBackgroundMatch(on) then
+			S.syncing = true
+			S.bgMatch:Set(false, true)
+			S.syncing = false
+			S.bgNote:Set(win._bg and "Colour matching needs a colour map for this video/image: make one with tools/novaui_tool.py (see README), or use a Pixels picture." or "Set a background first.")
+		else
+			S.bgNote:Set(on and "Buttons and text now follow the colours behind them (beta)." or "Colour matching off.")
+		end
+	end, { Hotkey = false })
+	host:Button("Remove background", function()
+		win:ClearBackground()
+		S.bgNote:Set("Background removed.")
+	end, { Hotkey = false })
+	self._bgStatus = function(status)
+		if string.sub(status, 1, 6) == "failed" then
+			S.bgNote:Set("Could not load it (" .. string.sub(status, 9) .. ")")
+		elseif status == "ready" then
+			S.bgNote:Set("Background ready.")
+		end
+	end
+end
+
+function Library:_bgSync()
+	local S = self._settings
+	if not S or not S.bgDim then
+		return
+	end
+	S.syncing = true
+	local bg = self._bg
+	if bg then
+		S.bgDim:Set(math.floor(bg.dim * 100 + 0.5), true)
+		S.bgGlass:Set(math.floor(bg.glass * 100 + 0.5), true)
+		S.bgMatch:Set(bg.match == true, true)
+	else
+		S.bgMatch:Set(false, true)
+	end
+	S.syncing = false
 end
 
 ----------------------------------------------------------------------
