@@ -2335,7 +2335,7 @@ test("settings: without file access presets still work for the session and say s
 	check(found, "status explains presets are not saved to disk")
 end)
 
-test("settings: keep-on-screen toggle changes behaviour live; centre button recentres", function()
+test("settings: keep-on-screen toggle changes behaviour live; the old Centre window button is gone", function()
 	local _, win = setWin()
 	win:SetSettingsOpen(true)
 	win._settings.keepToggle:Set(false)
@@ -2344,10 +2344,8 @@ test("settings: keep-on-screen toggle changes behaviour live; centre button rece
 	win._settings.keepToggle:Set(true)
 	M.advance(0.5)
 	check(win._main.Position.X.Offset < 3000, "pulled back when turned on")
-	clickRow(win, "Centre window")
-	M.advance(0.5)
-	near(win._main.Position.X.Offset, 0, 0.5, "centred")
-	near(win._main.Position.X.Scale, 0.5, 0.001, "centred scale")
+	local ok = pcall(clickRow, win, "Centre window")
+	check(not ok, "no Centre window button any more")
 end)
 
 test("settings: Kavo ChangeColor still works and goes through the same recolour", function()
@@ -2931,6 +2929,859 @@ test("regression: Kavo API surface still complete", function()
 	Lib:ToggleUI()
 	M.advance(1)
 	check(win.Visible, "ToggleUI round trip")
+end)
+
+----------------------------------------------------------------------
+-- 8. Round 3: presets save every element, executor blame, folder backgrounds, UNC test
+----------------------------------------------------------------------
+local function wipeExec()
+	for _, n in ipairs({ "writefile", "readfile", "isfile", "isfolder", "makefolder", "listfiles", "delfile", "getcustomasset", "getsynasset", "setclipboard", "toclipboard", "request", "http_request" }) do
+		_G[n] = nil
+	end
+end
+
+-- a fuller fake executor: in-memory files and folders, with switches to break individual functions
+local function fullExec(broken)
+	broken = broken or {}
+	wipeExec()
+	local ex = { fs = {}, folders = {}, clip = nil }
+	local function guard(name, fn)
+		if broken[name] == "missing" then
+			return nil
+		end
+		return function(...)
+			if broken[name] then
+				error(broken[name], 0)
+			end
+			return fn(...)
+		end
+	end
+	_G.writefile = guard("writefile", function(path, data) ex.fs[path] = data end)
+	_G.readfile = guard("readfile", function(path)
+		if ex.fs[path] == nil then error("cannot find file " .. path, 0) end
+		return ex.fs[path]
+	end)
+	_G.isfile = guard("isfile", function(path) return ex.fs[path] ~= nil end)
+	_G.isfolder = guard("isfolder", function(path) return ex.folders[path] == true end)
+	_G.makefolder = guard("makefolder", function(path) ex.folders[path] = true end)
+	_G.listfiles = guard("listfiles", function(dir)
+		local out = {}
+		for path in pairs(ex.fs) do
+			if string.sub(path, 1, #dir + 1) == dir .. "/" then
+				table.insert(out, (string.gsub(path, "/", "\\"))) -- some executors answer with backslashes
+			end
+		end
+		return out
+	end)
+	_G.delfile = guard("delfile", function(path) ex.fs[path] = nil end)
+	_G.getcustomasset = guard("getcustomasset", function(path)
+		if ex.fs[path] == nil then error("file does not exist", 0) end
+		return "rbxasset://custom/" .. path
+	end)
+	_G.setclipboard = guard("setclipboard", function(text) ex.clip = text end)
+	return ex
+end
+
+local function stateWindow()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	local tab = win:Tab("Main")
+	local log = {}
+	local jump = tab:Button("Jump", function() table.insert(log, "jump") end)
+	local fly = tab:Toggle("Fly", false, function(v) table.insert(log, "fly=" .. tostring(v)) end)
+	local speed = tab:Slider("Speed", 0, 100, 16, function(v) table.insert(log, "speed=" .. tostring(v)) end)
+	local name = tab:Input("Name", "type", function(v) table.insert(log, "name=" .. v) end)
+	local team = tab:Dropdown("Team", { "Red", "Blue" }, function(v) table.insert(log, "team=" .. v) end)
+	local tint = tab:ColorPicker("Tint", c3(255, 0, 0), function(c) table.insert(log, "tint") end)
+	win:SetVisible(true)
+	M.advance(0.6)
+	win:SetSettingsOpen(true)
+	return Lib, win, { jump = jump, fly = fly, speed = speed, name = name, team = team, tint = tint, log = log }
+end
+
+local function loadPreset(win, presetName)
+	local opt = optionByText(win._settings.page, presetName)
+	assert(opt, "preset not listed: " .. presetName)
+	opt.Activated:Fire()
+end
+
+test("presets: toggles, sliders, inputs, dropdowns, colours and hotkeys all come back (button M + toggle ON)", function()
+	fullExec()
+	local _, win, e = stateWindow()
+	e.jump:SetHotkey(KC("M"))
+	e.fly:Set(true)
+	e.speed:Set(80)
+	e.name:Set("bob")
+	e.team:Set("Blue", true)
+	e.tint:Set(c3(10, 200, 30), true)
+	win._settings.nameInput:Set("Mine")
+	clickRow(win, "Save preset")
+	-- change everything
+	e.jump:SetHotkey(KC("Z"))
+	e.fly:Set(false)
+	e.speed:Set(5)
+	e.name:Set("")
+	e.team:Set("Red", true)
+	e.tint:Set(c3(1, 2, 3), true)
+	for i = #e.log, 1, -1 do e.log[i] = nil end
+	loadPreset(win, "Mine")
+	eq(e.jump:GetHotkey(), KC("M"), "button hotkey is M again")
+	eq(chipOf(e.jump).Text, "M", "the hotkey box shows M")
+	eq(e.fly.Get(), true, "toggle is ON again")
+	eq(e.speed.Get(), 80, "slider")
+	eq(e.name:Get(), "bob", "input text")
+	eq(e.team:Get(), "Blue", "dropdown")
+	eq(e.tint:Get(), c3(10, 200, 30), "colour")
+	local ran = table.concat(e.log, ",")
+	check(string.find(ran, "fly=true", 1, true), "loading ran the toggle's callback: " .. ran)
+	check(string.find(ran, "speed=80", 1, true), "loading ran the slider's callback")
+	check(string.find(ran, "team=Blue", 1, true), "loading ran the dropdown's callback")
+	check(not string.find(ran, "jump", 1, true), "loading never presses a button")
+	press("M")
+	eq(e.log[#e.log], "jump", "the restored hotkey really triggers the button")
+	wipeExec()
+end)
+
+test("presets: loading twice runs callbacks only for what changed", function()
+	fullExec()
+	local _, win, e = stateWindow()
+	e.fly:Set(true)
+	win._settings.nameInput:Set("Same")
+	clickRow(win, "Save preset")
+	for i = #e.log, 1, -1 do e.log[i] = nil end
+	loadPreset(win, "Same")
+	eq(#e.log, 0, "nothing changed, nothing re-run")
+	wipeExec()
+end)
+
+test("presets: PresetCallbacks=false restores the look of the controls but runs no callbacks", function()
+	fullExec()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false, PresetCallbacks = false })
+	local tab = win:Tab("Main")
+	local hits = 0
+	local fly = tab:Toggle("Fly", false, function() hits = hits + 1 end)
+	win:SetVisible(true)
+	M.advance(0.6)
+	win:SetSettingsOpen(true)
+	fly:Set(true, true)
+	win._settings.nameInput:Set("Quiet")
+	clickRow(win, "Save preset")
+	fly:Set(false, true)
+	loadPreset(win, "Quiet")
+	eq(fly.Get(), true, "toggle shows on")
+	eq(hits, 0, "no callback")
+	wipeExec()
+end)
+
+test("presets: hotkeys can swap inside one preset; a key used by something else is skipped and reported", function()
+	fullExec()
+	local _, win, tab = (function()
+		local Lib = loadLib()
+		local w = Lib.new({ Loader = false })
+		local t = w:Tab("Main")
+		w:SetVisible(true)
+		M.advance(0.6)
+		return Lib, w, t
+	end)()
+	local a = tab:Button("A", function() end)
+	local b = tab:Button("B", function() end)
+	local c = tab:Button("C", function() end)
+	a:SetHotkey(KC("Q"))
+	b:SetHotkey(KC("E"))
+	win:SetSettingsOpen(true)
+	win._settings.nameInput:Set("Swap")
+	clickRow(win, "Save preset")
+	a:SetHotkey(KC("E")) -- swap them behind the preset's back
+	b:SetHotkey(KC("Q"))
+	c:SetHotkey(KC("F"))
+	loadPreset(win, "Swap")
+	eq(a:GetHotkey(), KC("Q"), "A back on Q")
+	eq(b:GetHotkey(), KC("E"), "B back on E")
+	eq(c:GetHotkey(), nil, "C was saved as 'no hotkey', so the preset clears the F it got meanwhile")
+	wipeExec()
+end)
+
+test("presets: a hotkey now owned by an element outside the preset is skipped and counted", function()
+	fullExec()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	local tab = win:Tab("Main")
+	win:SetVisible(true)
+	M.advance(0.6)
+	local a = tab:Button("A", function() end)
+	a:SetHotkey(KC("Q"))
+	win:SetSettingsOpen(true)
+	win._settings.nameInput:Set("Conflict")
+	clickRow(win, "Save preset")
+	local late = tab:Button("Late", function() end) -- added after the preset was saved
+	a:SetHotkey(KC("X"))
+	late:SetHotkey(KC("Q"))
+	loadPreset(win, "Conflict")
+	eq(late:GetHotkey(), KC("Q"), "the newer element keeps Q")
+	eq(a:GetHotkey(), KC("X"), "A keeps its previous key instead of ending up with none")
+	local found = false
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if type(d._props.Text) == "string" and d._props.Text:find("skipped", 1, true) then found = true end
+	end
+	check(found, "status says a hotkey was skipped")
+	wipeExec()
+end)
+
+test("presets: elements that no longer exist are counted, new elements are left alone", function()
+	fullExec()
+	local _, win, e = stateWindow()
+	e.fly:Set(true)
+	win._settings.nameInput:Set("Old")
+	clickRow(win, "Save preset")
+	local store = nil
+	-- same code, but loaded into a window that lacks the Fly toggle
+	local code
+	for _, d in ipairs(win._settings.page:GetDescendants()) do end
+	local Lib2 = loadLib()
+	local win2 = Lib2.new({ Loader = false })
+	local tab2 = win2:Tab("Main")
+	local other = tab2:Toggle("Other", true, function() end)
+	win2:SetVisible(true)
+	M.advance(0.6)
+	win2:SetSettingsOpen(true)
+	win2._settings.codeInput:Set("")
+	-- take the saved code from the disk file written by window 1
+	local line = _G.readfile("NovaUI/presets.txt")
+	code = string.match(line, "\t(NVP1[^\r\n]+)")
+	check(code ~= nil, "found saved code")
+	win2._settings.codeInput.Instance:GetDescendants()
+	local look = (function() return code end)()
+	-- import through the box
+	local box
+	for _, d in ipairs(win2._settings.page:GetDescendants()) do
+		if d._class == "TextBox" and d.PlaceholderText == "paste a code, press Enter" then box = d end
+	end
+	box.Text = code
+	box.FocusLost:Fire(true)
+	eq(other.Get(), true, "an element the preset never heard of keeps its value")
+	local found = false
+	for _, d in ipairs(win2._settings.page:GetDescendants()) do
+		if type(d._props.Text) == "string" and d._props.Text:find("not found in this script", 1, true) then found = true end
+	end
+	check(found, "status counts the missing ones")
+	wipeExec()
+end)
+
+test("presets: look code contains hotkeys and values, never raw separators from user text", function()
+	fullExec()
+	local _, win, e = stateWindow()
+	e.name:Set("a;b=c,d:e|f\nline")
+	win._settings.nameInput:Set("Weird")
+	clickRow(win, "Save preset")
+	local file = _G.readfile("NovaUI/presets.txt")
+	local code = string.match(file, "\t(NVP1[^\r\n]+)")
+	check(code and string.find(code, ";U=", 1, true), "has a values field")
+	check(string.find(code, ";Y=", 1, true), "has a hotkeys field")
+	check(not string.find(code, "a;b", 1, true), "text is escaped")
+	e.name:Set("")
+	loadPreset(win, "Weird")
+	eq(e.name:Get(), "a;b=c,d:e|f\nline", "hostile text round-trips exactly")
+	wipeExec()
+end)
+
+test("presets: a hostile or truncated U/Y field never crashes loading", function()
+	fullExec()
+	-- real Roblox: an unknown member name raises an error, and GetEnumItems is a method, not a key
+	local kcMeta = getmetatable(M.Enum.KeyCode)
+	local oldIndex = kcMeta.__index
+	kcMeta.__index = function(tbl, name)
+		if name == "NotAKey" then
+			error(name .. " is not a valid member of Enum.KeyCode", 2)
+		elseif name == "GetEnumItems" then
+			return function() return {} end
+		end
+		return oldIndex(tbl, name)
+	end
+	local _, win, e = stateWindow()
+	local box
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if d._class == "TextBox" and d.PlaceholderText == "paste a code, press Enter" then box = d end
+	end
+	local base = "NVP1;S=ff0000;B=000000;H=111111;T=ffffff;E=222222;K=1"
+	for _, tail in ipairs({
+		";U=,,,::,x:y:z,Main%2FFly:t:maybe,Main%2FSpeed:s:nan,Main%2FSpeed:s:inf,Main%2FTint:c:zzzzzz",
+		";Y=Main%2FJump:NotAKey,%00:-,:::",
+		";Y=Main%2FJump:RightShift",
+		";Y=Main%2FJump:Unknown",
+		";Y=Main%2FJump:GetEnumItems",
+		";U=" .. string.rep("a:b:c,", 1000),
+		";U=Main%2FTeam:d:Green",
+	}) do
+		box.Text = base .. tail
+		box.FocusLost:Fire(true)
+	end
+	eq(e.fly.Get(), false, "invalid toggle value ignored")
+	eq(e.speed.Get(), 16, "nan / inf ignored")
+	eq(e.jump:GetHotkey(), nil, "unknown key and RightShift refused")
+	eq(e.team:Get(), nil, "an option that is not in the list is ignored")
+	kcMeta.__index = oldIndex
+	wipeExec()
+end)
+
+test("presets: the same hotkey id twice in one code is applied once (first wins)", function()
+	fullExec()
+	local _, win, e = stateWindow()
+	local box
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if d._class == "TextBox" and d.PlaceholderText == "paste a code, press Enter" then box = d end
+	end
+	box.Text = "NVP1;S=ff0000;B=000000;H=111111;T=ffffff;E=222222;K=1;Y=Main%2FJump:F,Main%2FJump:G"
+	box.FocusLost:Fire(true)
+	eq(e.jump:GetHotkey(), KC("F"), "first entry wins")
+	wipeExec()
+end)
+
+test("presets: Keybind elements come back too (and a cleared keybind is cleared again)", function()
+	fullExec()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	local tab = win:Tab("Main")
+	local fired = 0
+	local aim = tab:Keybind("Aim", KC("F"), function() fired = fired + 1 end)
+	local dash = tab:Keybind("Dash", nil, function() end)
+	win:SetVisible(true)
+	M.advance(0.6)
+	win:SetSettingsOpen(true)
+	win._settings.nameInput:Set("Keys")
+	clickRow(win, "Save preset")
+	aim:Set(KC("H"))
+	dash:Set(KC("J"))
+	loadPreset(win, "Keys")
+	eq(aim.Get(), KC("F"), "Aim back on F")
+	eq(dash.Get(), nil, "Dash cleared again")
+	eq(fired, 0, "loading a preset never fires a keybind")
+	press("F")
+	eq(fired, 1, "the restored key works")
+	wipeExec()
+end)
+
+test("presets: old codes without hotkeys/values still load and leave elements alone", function()
+	fullExec()
+	local _, win, e = stateWindow()
+	e.fly:Set(true)
+	local box
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if d._class == "TextBox" and d.PlaceholderText == "paste a code, press Enter" then box = d end
+	end
+	box.Text = "NVP1;S=ff0000;B=000000;H=111111;T=ffffff;E=222222;K=1"
+	box.FocusLost:Fire(true)
+	eq(e.fly.Get(), true, "toggle untouched")
+	eq(win._scheme.SchemeColor, c3(255, 0, 0), "colours applied")
+	wipeExec()
+end)
+
+test("presets: duplicate labels get stable #2 ids and settings controls are never saved", function()
+	fullExec()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	local tab = win:Tab("Main")
+	local t1 = tab:Toggle("Same", false, function() end)
+	local t2 = tab:Toggle("Same", false, function() end)
+	win:SetVisible(true)
+	M.advance(0.6)
+	win:SetSettingsOpen(true)
+	t2:Set(true)
+	win._settings.nameInput:Set("Twins")
+	clickRow(win, "Save preset")
+	t2:Set(false)
+	loadPreset(win, "Twins")
+	eq(t1.Get(), false, "first twin untouched")
+	eq(t2.Get(), true, "second twin restored")
+	for _, st in ipairs(win._states) do
+		check(not string.find(st.id, "Settings/", 1, true) and not string.find(st.id, "ColorPanel/", 1, true), "internal control leaked into state: " .. st.id)
+	end
+	wipeExec()
+end)
+
+test("presets: a preset saved without a background removes the current one on load; Pixels backgrounds are left alone", function()
+	fullExec()
+	local _, win, e = stateWindow()
+	win._settings.nameInput:Set("Plain")
+	clickRow(win, "Save preset")
+	win:SetBackground({ Image = 12345 })
+	M.advance(0.5)
+	check(win._bg ~= nil, "background set")
+	loadPreset(win, "Plain")
+	check(win._bg == nil, "background removed by the preset")
+	wipeExec()
+end)
+
+test("presets: Kavo-style elements are saved too", function()
+	fullExec()
+	local Lib = loadLib()
+	local win = Lib.CreateLib("Hub", "DarkTheme", { Loader = false })
+	local tab = win:NewTab("T")
+	local sec = tab:NewSection("S")
+	local tog = sec:NewToggle("Aim", "i", function() end)
+	win:SetVisible(true)
+	M.advance(0.6)
+	tog:UpdateToggle(nil, true)
+	win:SetSettingsOpen(true)
+	win._settings.nameInput:Set("Kavo")
+	clickRow(win, "Save preset")
+	local file = _G.readfile("NovaUI/presets.txt")
+	check(string.find(file, "T%2FAim:t:1", 1, true), "toggle in the code: " .. tostring(file))
+	wipeExec()
+end)
+
+test("presets: a toggle callback that loops with task.wait() does not stop the rest of the preset", function()
+	fullExec()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	local tab = win:Tab("Main")
+	local running, ticks = false, 0
+	local fly = tab:Toggle("Fly", false, function(on)
+		running = on
+		while running do -- the usual exploit-script pattern
+			ticks = ticks + 1
+			task.wait(0.1)
+		end
+	end)
+	local speed = tab:Slider("Speed", 0, 100, 16, function() end)
+	local name = tab:Input("Name", "type", function() end)
+	local team = tab:Dropdown("Team", { "Red", "Blue" }, function() end)
+	win:SetVisible(true)
+	M.advance(0.6)
+	win:SetSettingsOpen(true)
+	fly:Set(true)
+	speed:Set(80)
+	name:Set("bob")
+	team:Set("Blue", true)
+	win._settings.nameInput:Set("Loop")
+	clickRow(win, "Save preset")
+	fly:Set(false)
+	M.advance(0.3)
+	speed:Set(5)
+	name:Set("")
+	team:Set("Red", true)
+	loadPreset(win, "Loop")
+	M.advance(0.5)
+	eq(fly.Get(), true, "toggle on")
+	check(running and ticks >= 3, "its loop is running on its own thread (ticks=" .. ticks .. ")")
+	eq(speed.Get(), 80, "slider after the looping toggle restored")
+	eq(name:Get(), "bob", "input after the looping toggle restored")
+	eq(team:Get(), "Blue", "dropdown after the looping toggle restored")
+	running = false
+	wipeExec()
+end)
+
+-- executor blame ---------------------------------------------------------------------------------
+test("blame: a failing writefile is reported as the executor's problem with the function name", function()
+	fullExec({ writefile = "extension not allowed" })
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	win._settings.nameInput:Set("Blame")
+	clickRow(win, "Save preset")
+	local text
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if type(d._props.Text) == "string" and d._props.Text:find("this session only", 1, true) then text = d._props.Text end
+	end
+	check(text and text:find("'writefile'", 1, true), "status names writefile: " .. tostring(text))
+	check(text:find("executor", 1, true), "says executor")
+	check(warned("UNC / executor problem, not NovaUI's code"), "console warning blames the executor")
+	local issues = Library_issues and Library_issues() or nil
+	wipeExec()
+end)
+
+test("blame: the same failure is warned about once, and listed by GetExecutorIssues", function()
+	local ex = fullExec({ writefile = "access denied" })
+	local Lib, win = setWin()
+	win:SetSettingsOpen(true)
+	local before = #M.warnings
+	for i = 1, 3 do
+		win._settings.nameInput:Set("P" .. i)
+		clickRow(win, "Save preset")
+	end
+	local count = 0
+	for i = before + 1, #M.warnings do
+		if M.warnings[i]:find("'writefile'", 1, true) then count = count + 1 end
+	end
+	eq(count, 1, "one warning only")
+	local issues = Lib.GetExecutorIssues()
+	check(#issues >= 1 and issues[1].Function == "writefile", "issue recorded")
+	check(issues[1].Hint:find("blocked", 1, true), "plain-words hint: " .. tostring(issues[1].Hint))
+	wipeExec()
+end)
+
+test("blame: hints separate a missing function, a blocked call and a path problem", function()
+	local Lib = loadLib()
+	for raw, expect in pairs({
+		["attempt to call a nil value"] = "does not really implement",
+		["file extension not allowed"] = "refuses this kind of file",
+		["permission denied"] = "blocked",
+		["no such directory"] = "could not use the path",
+		["bad argument #1"] = "argument check",
+		["boom"] = "raised an error",
+	}) do
+		fullExec({ makefolder = raw, isfolder = false })
+		local win = Lib.new({ Loader = false })
+		win:Tab("Main")
+		win:SetVisible(true)
+		M.advance(0.6)
+		win:SetSettingsOpen(true)
+		win._settings.nameInput:Set("H")
+		clickRow(win, "Save preset")
+		wipeExec()
+	end
+	check(true, "no crash for every raw error text")
+end)
+
+test("blame: missing getcustomasset is reported as an executor gap, not a library error", function()
+	fullExec({ getcustomasset = "missing" })
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetVisible(true)
+	win:SetBackground("intro.webm")
+	M.advance(0.5)
+	check(win._bg.status:find("getcustomasset", 1, true), "status names the function: " .. tostring(win._bg.status))
+	check(win._bg.status:find("asset id", 1, true), "suggests an alternative")
+	wipeExec()
+end)
+
+test("blame: setclipboard failing still shows the code in the box and says why in the console", function()
+	local ex = fullExec({ setclipboard = "permission denied" })
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	clickRow(win, "Export look (copy code)")
+	check(win._settings.codeInput:Get():find("NVP1", 1, true), "code in box")
+	check(warned("'setclipboard'"), "warned about setclipboard")
+	wipeExec()
+end)
+
+-- folder backgrounds -----------------------------------------------------------------------------
+test("folder: a bare file name resolves from workspace/NovaUI/backgrounds", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/intro.webm"] = "\26\69\223\163xxxx"
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetVisible(true)
+	M.advance(0.6)
+	win:SetBackground({ Video = "intro.webm" })
+	M.advance(0.5)
+	eq(win._bg.status, "ready", "ready")
+	eq(win._bg.source, "NovaUI/backgrounds/intro.webm", "stored with its full path")
+	eq(win._bg.asset, "rbxasset://custom/NovaUI/backgrounds/intro.webm", "asset from getcustomasset")
+	check(win._bgVideo ~= nil, "video frame created")
+	wipeExec()
+end)
+
+test("folder: a string with a known extension is enough; images work the same way", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/wall.png"] = PNG
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetVisible(true)
+	win:SetBackground("wall.png")
+	M.advance(0.5)
+	eq(win._bg.kind, "image", "image")
+	eq(win._bg.status, "ready", "ready")
+	wipeExec()
+end)
+
+test("folder: a missing file says where to put it", function()
+	fullExec()
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetVisible(true)
+	win:SetBackground({ Video = "nothing.webm" })
+	M.advance(0.5)
+	check(win._bg.status:find("file not found", 1, true) and win._bg.status:find("NovaUI/backgrounds", 1, true), win._bg.status)
+	wipeExec()
+end)
+
+test("folder: path tricks are not treated as folder files", function()
+	local ex = fullExec()
+	ex.fs["secret.webm"] = "x"
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetVisible(true)
+	for _, bad in ipairs({ "../secret.webm", "NovaUI/backgrounds/../../secret.webm", "a/b.webm", "C:\\x.webm", "..webm", "x..y.webm", "NovaUI/backgrounds/sub/a.webm", "name;rm.webm" }) do
+		win:SetBackground({ Video = bad })
+		M.advance(0.3)
+		check(win._bg.status ~= "ready", "refused: " .. bad .. " -> " .. tostring(win._bg.status))
+	end
+	wipeExec()
+end)
+
+test("folder: wrong kind of file for the slot is explained", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/a.png"] = PNG
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetVisible(true)
+	win:SetBackground({ Video = "a.png" })
+	M.advance(0.3)
+	check(win._bg.status:find("image, not a video", 1, true), win._bg.status)
+	wipeExec()
+end)
+
+test("folder: the settings picker lists only usable files (also with backslash paths) and uses them", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/zeta.webm"] = "x"
+	ex.fs["NovaUI/backgrounds/Alpha.png"] = PNG
+	ex.fs["NovaUI/backgrounds/notes.txt"] = "x"
+	ex.fs["NovaUI/backgrounds/bad;name.webm"] = "x"
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local S = win._settings
+	check(ex.folders["NovaUI/backgrounds"], "folder created for the user")
+	check(optionByText(S.page, "Alpha.png") ~= nil and optionByText(S.page, "zeta.webm") ~= nil, "usable files listed")
+	check(optionByText(S.page, "notes.txt") == nil, "txt hidden")
+	check(optionByText(S.page, "bad;name.webm") == nil, "unsafe name hidden")
+	optionByText(S.page, "Alpha.png").Activated:Fire()
+	M.advance(0.5)
+	eq(win._bg.source, "NovaUI/backgrounds/Alpha.png", "picked file is the background")
+	wipeExec()
+end)
+
+test("folder: new files show up after Refresh files; an executor without listfiles says to type the name", function()
+	local ex = fullExec()
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	check(optionByText(win._settings.page, "new.png") == nil, "not yet")
+	ex.fs["NovaUI/backgrounds/new.png"] = PNG
+	clickRow(win, "Refresh files")
+	check(optionByText(win._settings.page, "new.png") ~= nil, "listed after refresh")
+	fullExec({ listfiles = "missing" })
+	local _, win2 = setWin()
+	win2:SetSettingsOpen(true)
+	local found = false
+	for _, d in ipairs(win2._settings.page:GetDescendants()) do
+		if type(d._props.Text) == "string" and d._props.Text:find("type the file name in Source", 1, true) then found = true end
+	end
+	check(found, "explains the alternative")
+	wipeExec()
+end)
+
+test("folder: typing a file name into Source works, and the preset remembers the full path", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/loop.webm"] = "\26\69\223\163xxxx"
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	win._settings.bgSource:Set("loop.webm")
+	local box
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if d._class == "TextBox" and d.PlaceholderText == "file name, asset id or https link, press Enter" then box = d end
+	end
+	box.Text = "loop.webm"
+	box.FocusLost:Fire(true)
+	M.advance(0.5)
+	eq(win._bg.status, "ready", "loaded")
+	win._settings.nameInput:Set("Vid")
+	clickRow(win, "Save preset")
+	win:ClearBackground()
+	loadPreset(win, "Vid")
+	M.advance(0.5)
+	eq(win._bg and win._bg.source, "NovaUI/backgrounds/loop.webm", "preset brought the background back from the folder")
+	wipeExec()
+end)
+
+test("folder: a video Roblox has not loaded after 10 s gets a plain-words note", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/slow.webm"] = "\26\69\223\163xxxx"
+	local Lib = loadLib()
+	local win = Lib.new({ Loader = false })
+	win:Tab("Main")
+	win:SetVisible(true)
+	win:SetBackground({ Video = "slow.webm" })
+	M.advance(0.5)
+	win._bgVideo.IsLoaded = false
+	M.advance(11)
+	check(win._bg.note and win._bg.note:find("webm", 1, true), "note set")
+	check(warned("has not loaded this video"), "console hint")
+	wipeExec()
+end)
+
+test("unc_test.lua: the standalone script loads the library and prints the report (and blames the executor when it cannot)", function()
+	local ex = fullExec()
+	local script = readFile(SRC_DIR .. "/unc_test.lua")
+	local lines = {}
+	local savedLoadstring = _G.loadstring
+	local realPrint = print
+	print = function(text) table.insert(lines, tostring(text)) end
+	_G.loadstring = function(code)
+		return load(code, "=chunk")
+	end
+	M.game.HttpGet = function() return srcText end
+	local ok, report = pcall(assert(load(script, "=unc_test")))
+	print = realPrint
+	check(ok, "script ran: " .. tostring(report))
+	check(type(report) == "table" and report.Healthy, "healthy report returned: " .. tostring(type(report) == "table" and report.Summary or report))
+	check(#lines >= 15 and lines[1]:find("%[NovaUI UNC%]"), "printed the lines")
+	for name in pairs(ex.fs) do check(not name:find("_unc_test", 1, true), "leftover " .. name) end
+
+	-- HttpGet refused: the script says it is the executor's problem and stops
+	M.game.HttpGet = function() error("HttpGet is not allowed", 0) end
+	local before = #M.warnings
+	local ok2, r2 = pcall(assert(load(script, "=unc_test")))
+	check(ok2 and r2 == nil, "stops quietly")
+	check(M.warnings[#M.warnings] and M.warnings[#M.warnings]:find("executor / network problem, not NovaUI", 1, true), "blames the executor: " .. tostring(M.warnings[#M.warnings]))
+
+	-- no loadstring at all
+	M.game.HttpGet = function() return srcText end
+	_G.loadstring = nil
+	local ok3 = pcall(assert(load(script, "=unc_test")))
+	check(ok3, "no crash without loadstring")
+	check(M.warnings[#M.warnings]:find("no loadstring", 1, true), "says loadstring is missing")
+	_G.loadstring = savedLoadstring
+	wipeExec()
+end)
+
+-- UNC test ---------------------------------------------------------------------------------------
+test("unc: a healthy executor passes every check and leaves no test files behind", function()
+	local ex = fullExec()
+	local Lib = loadLib()
+	local report = Lib.UNCTest({ Quiet = true })
+	eq(report.Counts.FAIL, 0, "no failures: " .. report.Summary)
+	check(report.Healthy, "healthy: " .. report.Summary)
+	for name, _ in pairs(ex.fs) do
+		check(not string.find(name, "_unc_test", 1, true), "leftover " .. name)
+	end
+	for _, f in ipairs(report.Features) do
+		check(f.Ok, "feature ok: " .. f.Name .. " " .. f.Note)
+	end
+	wipeExec()
+end)
+
+test("unc: each broken function is named, with the executor blamed and the cause in plain words", function()
+	local cases = {
+		{ "writefile", "file extension not allowed", "writefile", "refuses this kind of file" },
+		{ "readfile", "permission denied", "readfile", "blocked" },
+		{ "isfile", "attempt to call a nil value", "isfile", "does not really implement" },
+		{ "listfiles", "no such directory", "listfiles", "could not use the path" },
+		{ "getcustomasset", "boom", "getcustomasset (png)", "raised an error" },
+	}
+	for _, c in ipairs(cases) do
+		fullExec({ [c[1]] = c[2] })
+		local Lib = loadLib()
+		local report = Lib.UNCTest({ Quiet = true })
+		local row
+		for _, r in ipairs(report.Results) do
+			if r.Name == c[3] then row = r end
+		end
+		check(row ~= nil, c[1] .. ": row exists")
+		eq(row.Status, "FAIL", c[1] .. ": status")
+		check(row.Note:find("executor function '" .. c[1] .. "'", 1, true), c[1] .. ": names the function: " .. row.Note)
+		check(row.Note:find(c[4], 1, true), c[1] .. ": hint: " .. row.Note)
+		check(row.Note:find(c[2], 1, true), c[1] .. ": raw error kept: " .. row.Note)
+		check(not report.Healthy, c[1] .. ": not healthy")
+		check(report.Summary:find("not NovaUI", 1, true), c[1] .. ": summary blames the executor")
+	end
+	wipeExec()
+end)
+
+test("unc: a missing function is MISSING, optional ones do not make the report unhealthy", function()
+	fullExec({ setclipboard = "missing", delfile = "missing" })
+	local Lib = loadLib()
+	local report = Lib.UNCTest({ Quiet = true })
+	local seen = {}
+	for _, r in ipairs(report.Results) do seen[r.Name] = r end
+	eq(seen.setclipboard.Status, "MISSING", "clipboard missing")
+	eq(seen.delfile.Status, "MISSING", "delfile missing")
+	check(seen.delfile.Note:find("_unc_test", 1, true), "tells where the leftovers are")
+	check(report.Healthy, "optional gaps are not problems: " .. report.Summary)
+	wipeExec()
+	fullExec({ writefile = "missing" })
+	local report2 = Lib.UNCTest({ Quiet = true })
+	check(not report2.Healthy, "writefile is required")
+	local dependent = 0
+	for _, r in ipairs(report2.Results) do
+		if r.Status == "SKIP" and r.Note:find("needs writefile", 1, true) then dependent = dependent + 1 end
+	end
+	check(dependent >= 4, "dependent checks are skipped, not blamed on other functions")
+	wipeExec()
+end)
+
+test("unc: silent bugs are caught (binary mangled, isfile lying, listfiles without the file, empty asset)", function()
+	local ex = fullExec()
+	local realRead = _G.readfile
+	_G.readfile = function(path)
+		local data = realRead(path)
+		if string.find(path, ".bin", 1, true) then return (string.gsub(data, "\r\n", "\n")) end
+		return data
+	end
+	local Lib = loadLib()
+	local report = Lib.UNCTest({ Quiet = true })
+	local row
+	for _, r in ipairs(report.Results) do if r.Name == "readfile (binary)" then row = r end end
+	eq(row.Status, "FAIL", "binary mangling found")
+	check(row.Note:find("mangles", 1, true), row.Note)
+
+	fullExec()
+	_G.isfile = function() return false end
+	local r2 = Lib.UNCTest({ Quiet = true })
+	for _, r in ipairs(r2.Results) do if r.Name == "isfile" then row = r end end
+	eq(row.Status, "FAIL", "isfile lie found")
+
+	fullExec()
+	_G.listfiles = function() return {} end
+	local r3 = Lib.UNCTest({ Quiet = true })
+	for _, r in ipairs(r3.Results) do if r.Name == "listfiles" then row = r end end
+	eq(row.Status, "FAIL", "listing without the file found")
+
+	fullExec()
+	_G.getcustomasset = function() return "" end
+	local r4 = Lib.UNCTest({ Quiet = true })
+	for _, r in ipairs(r4.Results) do if r.Name == "getcustomasset (webm)" then row = r end end
+	eq(row.Status, "FAIL", "empty asset found")
+	wipeExec()
+end)
+
+test("unc: only the file type that is refused fails (webm refused, png fine)", function()
+	fullExec()
+	local real = _G.getcustomasset
+	_G.getcustomasset = function(path)
+		if string.find(path, ".webm", 1, true) then error("file type not allowed", 0) end
+		return real(path)
+	end
+	local Lib = loadLib()
+	local report = Lib.UNCTest({ Quiet = true })
+	local st = {}
+	for _, r in ipairs(report.Results) do st[r.Name] = r.Status end
+	eq(st["getcustomasset (png)"], "PASS", "png ok")
+	eq(st["getcustomasset (webm)"], "FAIL", "webm refused")
+	local limited = false
+	for _, f in ipairs(report.Features) do
+		if f.Name:find("Backgrounds from the NovaUI/backgrounds folder", 1, true) and not f.Ok then limited = true end
+	end
+	check(limited, "the folder-background feature is reported as limited")
+	wipeExec()
+end)
+
+test("unc: printing goes through Print, one line per check, and leftovers are cleaned even after failures", function()
+	local ex = fullExec({ getcustomasset = "boom" })
+	local lines = {}
+	local Lib = loadLib()
+	Lib.UNCTest({ Print = function(t) table.insert(lines, t) end })
+	check(#lines >= 15, "many lines: " .. #lines)
+	check(lines[1]:find("%[NovaUI UNC%]"), "prefixed")
+	for name in pairs(ex.fs) do check(not name:find("_unc_test", 1, true), "leftover " .. name) end
+	wipeExec()
+end)
+
+test("unc: the settings button runs the check and shows the summary", function()
+	fullExec({ writefile = "access denied" })
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	clickRow(win, "Run executor check")
+	local found = false
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if type(d._props.Text) == "string" and d._props.Text:find("UNC check:", 1, true) and d._props.Text:find("writefile", 1, true) then found = true end
+	end
+	check(found, "summary names writefile")
+	wipeExec()
 end)
 
 ----------------------------------------------------------------------

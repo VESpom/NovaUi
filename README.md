@@ -18,7 +18,9 @@ By default the UI shows an Enter button, then a loading bar, then opens. Pass `L
 
 Executor behaviour: parents to `gethui()`, else CoreGui, else PlayerGui. Re-running the script replaces the old window (via `getgenv().__NovaUI`). RightShift hides/shows the UI.
 
-Files: `source.lua` (the library), `example.lua` (every call, Kavo style), `example_native.lua` (NovaUI's own API: 5 button styles, tooltips, notifications).
+**New to this? Read [INSTRUCTIONS.md](INSTRUCTIONS.md)**: presets, folder backgrounds and the executor check, step by step.
+
+Files: `source.lua` (the library), `unc_test.lua` (executor check, no window), `example.lua` (every call, Kavo style), `example_native.lua` (NovaUI's own API: 5 button styles, tooltips, notifications).
 In Studio or your own game without an executor, put `source.lua` in a ModuleScript and `require` it.
 
 ## Key system (optional)
@@ -75,7 +77,8 @@ The gear next to minimise/close opens a settings page (click it again, or pick a
 
 - **Appearance**: theme dropdown (all 8 themes), colour pickers for accent, window, header/sidebar, buttons/rows and text, reset.
 - **Presets**: save the whole look under a name, load, delete, **export** a text code and **import** one (share looks with friends). With `writefile`/`readfile` presets are kept in `NovaUI/presets.txt`; without them they last for the session (the page tells you which).
-- **Window**: keep-on-screen toggle and a "Centre window" button.
+- **Window**: keep-on-screen toggle.
+- **Executor check**: tests your executor's file / asset functions (UNC) and names the one that fails.
 - **Background**: see below.
 
 `Window:ToggleSettings()`, `SetSettingsOpen(bool)`, `IsSettingsOpen()` and the Kavo `ChangeColor` all work from code too.
@@ -97,6 +100,7 @@ Window:ClearBackground()
 | Source | Needs | Notes |
 |---|---|---|
 | `Video = 123` / `"rbxassetid://123"` | an uploaded video | Loops, muted. Use roughly the window's shape (about 3:2), it is stretched to fit. |
+| `Video = "intro.webm"` (a file in `workspace/NovaUI/backgrounds`; also `Image = "wall.png"`) | executor `getcustomasset` (+ `listfiles` for the picker) | Easiest way. The settings panel lists the folder; see INSTRUCTIONS.md. |
 | `Video = "https://...webm"` (`.mp4` too) | executor `writefile` + `getcustomasset` | Downloaded once to `NovaUI/`, up to 40 MB. Not every executor plays local video: if it doesn't, nothing shows and a warning says why. |
 | `Image = ...` | same as the login image | Any option from the login image section works. |
 | `Pixels = { W, H, Data }` | nothing | Embedded picture, no downloads. |
@@ -128,3 +132,8 @@ It is a beta: colours update 5 times a second, and a button you are hovering kee
 `python3 test/test_tool.py` checks the converter tool (needs ffmpeg).
 
 `pip install lupa && python3 test/run_tests.py` runs the suite on a strict mock of the Roblox API (Lua 5.2 + `bit32`). It has not been run inside real Roblox.
+
+## Presets, executor blame, options (round 3)
+- Presets save hotkeys and every Toggle / Slider / Input / Dropdown / ColorPicker (matched by `Tab/Label`). Loading runs the callbacks of what changed; create the window with `PresetCallbacks = false` to skip that.
+- Dropdowns now have `:Get()` and `:Set(option, silent)`.
+- Executor functions are called through one wrapper: a failure names the function and says it is an executor (UNC) problem. `Library.GetExecutorIssues()` lists them; `Library.UNCTest()` runs the full check (also `unc_test.lua`).

@@ -955,6 +955,22 @@ function Library:_hotkeyId(base)
 	return n == 1 and base or (base .. " #" .. n)
 end
 
+-- Element state registry (what presets save besides hotkeys): every Toggle, Slider, Input, Dropdown and
+-- ColorPicker registers { kind, get() -> string|nil, set(string, fire) -> bool } under "Tab/Label".
+-- kinds: t toggle, s slider, i input, d dropdown, c colour. The window's own settings controls opt out.
+function Library:_addState(tab, kind, label, entry)
+	if tab._noState or self._destroyed then
+		return
+	end
+	local base = tab.Name .. "/" .. tostring(label)
+	local counterKey = kind .. "|" .. base
+	local n = (self._stateIds[counterKey] or 0) + 1
+	self._stateIds[counterKey] = n
+	entry.kind = kind
+	entry.id = n == 1 and base or (base .. " #" .. n)
+	table.insert(self._states, entry)
+end
+
 function Library:_keyTaken(code, except)
 	if code == self._toggleKey then
 		return true
@@ -1340,6 +1356,156 @@ local function envFn(getter)
 	return nil
 end
 
+----------------------------------------------------------------------
+-- Executor (UNC) functions, with blame.
+-- writefile, readfile, getcustomasset ... belong to the executor, not to NovaUI. Every call goes
+-- through uncRun, so a failure is reported as "your executor's <function> failed" with the raw
+-- error and a short hint, never as a NovaUI bug. Each problem is printed once per session and
+-- kept for Library.GetExecutorIssues(). unc_test.lua checks all of them in one go.
+----------------------------------------------------------------------
+
+local UNC_GETTERS = {
+	writefile = function() return writefile end,
+	readfile = function() return readfile end,
+	isfile = function() return isfile end,
+	isfolder = function() return isfolder end,
+	makefolder = function() return makefolder end,
+	listfiles = function() return listfiles end,
+	delfile = function() return delfile end,
+	getgenv = function() return getgenv end,
+	getcustomasset = function() return getcustomasset end,
+	getsynasset = function() return getsynasset end,
+	setclipboard = function() return setclipboard end,
+	toclipboard = function() return toclipboard end,
+	loadstring = function() return loadstring end,
+	request = function() return request end,
+	http_request = function() return http_request end,
+}
+local UNC_ALIASES = {
+	getcustomasset = { "getcustomasset", "getsynasset" },
+	setclipboard = { "setclipboard", "toclipboard" },
+	request = { "request", "http_request" },
+}
+local uncIssues = {}
+local uncSeen = {}
+
+-- returns the function and the name that was found (aliases: getcustomasset / getsynasset ...)
+local function uncFn(name)
+	for _, alias in ipairs(UNC_ALIASES[name] or { name }) do
+		local getter = UNC_GETTERS[alias]
+		local fn = getter and envFn(getter)
+		if fn then
+			return fn, alias
+		end
+	end
+	return nil, name
+end
+
+local function uncHint(err)
+	local e = string.lower(tostring(err))
+	local function has(...)
+		for _, part in ipairs({ ... }) do
+			if string.find(e, part, 1, true) then
+				return true
+			end
+		end
+		return false
+	end
+	if has("attempt to call a nil value", "not implemented", "unsupported") then
+		return "the executor lists this function but does not really implement it"
+	elseif has("extension", "file type", "filetype", "not allowed", "forbidden") then
+		return "the executor refuses this kind of file or path (its own workspace rules)"
+	elseif has("permission", "denied", "blocked", "sandbox", "disabled") then
+		return "the executor blocked the call (permission / sandbox rule)"
+	elseif has("path", "directory", "folder", "no such", "not exist", "cannot find") then
+		return "the executor could not use the path (its workspace folder rules)"
+	elseif has("bad argument", "invalid argument", "expected") then
+		return "the executor's own argument check rejected the call"
+	end
+	return "the executor's function raised an error"
+end
+
+-- kind: "missing" | "error" | "silent" (reported success, but the result does not add up)
+local function uncRecord(feature, name, kind, hint, raw)
+	local key = feature .. "|" .. name .. "|" .. kind
+	local text
+	if kind == "missing" then
+		text = "this executor has no '" .. name .. "' function, so it is not UNC-complete (an executor gap, not a NovaUI bug)"
+	elseif kind == "silent" then
+		text = "executor function '" .. name .. "' said it worked, but " .. tostring(raw) .. " (UNC / executor problem, not NovaUI's code)"
+	else
+		text = "executor function '" .. name .. "' failed: " .. hint .. ". Raw error: " .. tostring(raw) .. " (UNC / executor problem, not NovaUI's code)"
+	end
+	local message = "[NovaUI] " .. feature .. ": " .. text
+	if not uncSeen[key] then
+		uncSeen[key] = true
+		if #uncIssues < 60 then
+			table.insert(uncIssues, { Feature = feature, Function = name, Kind = kind, Hint = hint, Raw = raw and tostring(raw) or nil, Message = message })
+		end
+		warn(message .. ". Run unc_test.lua to see exactly which functions your executor supports.")
+	end
+	return text
+end
+
+-- ok, value, why. quietMissing = true: a missing function is not worth a console warning
+-- (used for passive reads); a function that exists but throws is always reported.
+local function uncRun(feature, name, quietMissing, ...)
+	local fn, used = uncFn(name)
+	if not fn then
+		if not quietMissing then
+			return false, nil, uncRecord(feature, name, "missing")
+		end
+		return false, nil, "this executor has no '" .. name .. "' function"
+	end
+	local ok, result = pcall(fn, ...)
+	if not ok then
+		local hint = uncHint(result)
+		uncRecord(feature, used, "error", hint, result)
+		return false, nil, "executor function '" .. used .. "' failed (" .. hint .. ")"
+	end
+	return true, result
+end
+
+-- Files the user drops into the executor's workspace folder (workspace/NovaUI/backgrounds).
+-- A source like "intro.webm" or "NovaUI/backgrounds/intro.webm" is a plain file name in that folder: no
+-- sub-folders, no "..", only letters, digits, space and - . _ ( ). Anything else is not treated as a file.
+local BG_FOLDER = "NovaUI/backgrounds"
+local BG_FILE_KINDS = { webm = "video", mp4 = "video", png = "image", jpg = "image", jpeg = "image" }
+
+local function localBgFile(src)
+	if type(src) ~= "string" or #src > 120 then
+		return nil
+	end
+	local name = string.match(src, "^NovaUI/backgrounds/(.+)$") or src
+	if string.find(name, "..", 1, true) or not string.match(name, "^[%w%-%._ %(%)]+$") then
+		return nil
+	end
+	local kind = BG_FILE_KINDS[string.lower(string.match(name, "%.(%w+)$") or "")]
+	if not kind then
+		return nil
+	end
+	return BG_FOLDER .. "/" .. name, kind, name
+end
+
+-- done(asset) | done(nil, reason). A missing file and a broken executor function give different reasons.
+local function resolveLocalFile(path, done)
+	if not uncFn("getcustomasset") then
+		return done(nil, "this executor has no getcustomasset, so files from the folder are unavailable: use an asset id instead (run unc_test.lua to confirm)")
+	end
+	local okFile, exists = uncRun("background folder", "isfile", true, path)
+	if okFile and exists == false then
+		return done(nil, "file not found: put it in workspace/" .. BG_FOLDER .. " (looked for " .. path .. ")")
+	end
+	local ok, asset, why = uncRun("background folder", "getcustomasset", false, path)
+	if ok and type(asset) == "string" and asset ~= "" then
+		return done(asset)
+	elseif ok then
+		uncRecord("background folder", "getcustomasset", "silent", nil, "it returned " .. type(asset) .. " for " .. path)
+		return done(nil, "executor function 'getcustomasset' returned nothing for " .. path .. " (UNC / executor problem: it may refuse this file type)")
+	end
+	return done(nil, tostring(why))
+end
+
 local function imageKind(data)
 	if string.sub(data, 1, 8) == "\137PNG\r\n\26\n" then
 		return "png"
@@ -1350,6 +1516,7 @@ local function imageKind(data)
 	return nil
 end
 
+-- body, or nil + the raw reason (a refused game:HttpGet is the executor's / network's doing, not NovaUI's)
 local function downloadImage(url)
 	local ok, body = pcall(function()
 		return game:HttpGet(url)
@@ -1357,18 +1524,16 @@ local function downloadImage(url)
 	if ok and type(body) == "string" and body ~= "" then
 		return body
 	end
-	local request = envFn(function()
-		return request
-	end) or envFn(function()
-		return http_request
-	end)
+	local reason = ok and "empty answer" or tostring(body)
+	local request = uncFn("request")
 	if request then
 		local ok2, res = pcall(request, { Url = url, Method = "GET" })
 		if ok2 and type(res) == "table" and res.StatusCode == 200 and type(res.Body) == "string" then
 			return res.Body
 		end
+		reason = ok2 and ("HTTP " .. tostring(type(res) == "table" and res.StatusCode or "?")) or tostring(res)
 	end
-	return nil
+	return nil, string.sub(reason, 1, 160)
 end
 
 -- done(asset) on success, done(nil, reason) otherwise. May answer later (downloads run in a thread).
@@ -1388,42 +1553,33 @@ local function resolveImage(src, done)
 	if string.match(src, "^rbxassetid://%d+$") then
 		return done(src)
 	end
-	if not string.match(src, "^https?://[%w%-%._~:/%?#@!$&'()*+,;=%%]+$") or #src > 2000 then
-		return done(nil, "unsupported image source (use an asset id or an http/https link)")
+	local localPath, localKind = localBgFile(src)
+	if localPath then
+		if localKind ~= "image" then
+			return done(nil, "that file is a video, not an image")
+		end
+		return resolveLocalFile(localPath, done)
 	end
-	local writeFile = envFn(function()
-		return writefile
-	end)
-	local getAsset = envFn(function()
-		return getcustomasset
-	end) or envFn(function()
-		return getsynasset
-	end)
-	if not writeFile or not getAsset then
+	if not string.match(src, "^https?://[%w%-%._~:/%?#@!$&'()*+,;=%%]+$") or #src > 2000 then
+		return done(nil, "unsupported image source (use an asset id, an http/https link, or a file name from workspace/NovaUI/backgrounds)")
+	end
+	if not uncFn("writefile") or not uncFn("getcustomasset") then
 		return done(nil, "this executor can't load images from links (needs writefile + getcustomasset); use an rbxassetid instead")
 	end
-	local isFile = envFn(function()
-		return isfile
-	end)
-	local makeFolder = envFn(function()
-		return makefolder
-	end)
 	-- the file name comes from a hash, never from the link
 	local base = "NovaUI/img_" .. string.sub(sha256(src), 1, 24)
 	task.spawn(function()
 		local path = nil
-		if isFile then
-			for _, ext in ipairs({ "png", "jpg" }) do
-				local ok, exists = pcall(isFile, base .. "." .. ext)
-				if ok and exists then
-					path = base .. "." .. ext
-				end
+		for _, ext in ipairs({ "png", "jpg" }) do
+			local ok, exists = uncRun("images", "isfile", true, base .. "." .. ext)
+			if ok and exists then
+				path = base .. "." .. ext
 			end
 		end
 		if not path then
-			local data = downloadImage(src)
+			local data, why = downloadImage(src)
 			if not data then
-				return done(nil, "download failed")
+				return done(nil, "download failed (" .. tostring(why) .. ")")
 			end
 			if #data > MAX_IMAGE_BYTES then
 				return done(nil, "image too large (max 8 MB)")
@@ -1432,19 +1588,24 @@ local function resolveImage(src, done)
 			if not kind then
 				return done(nil, "not a PNG or JPEG (Roblox cannot show webp/gif)")
 			end
-			if makeFolder then
-				pcall(makeFolder, "NovaUI")
+			local okFolder, hasFolder = uncRun("images", "isfolder", true, "NovaUI")
+			if not (okFolder and hasFolder) then
+				uncRun("images", "makefolder", true, "NovaUI")
 			end
 			path = base .. "." .. kind
-			if not pcall(writeFile, path, data) then
-				return done(nil, "could not save the image")
+			local okWrite, _, whyWrite = uncRun("images", "writefile", false, path, data)
+			if not okWrite then
+				return done(nil, "could not save the image: " .. tostring(whyWrite))
 			end
 		end
-		local ok, asset = pcall(getAsset, path)
+		local ok, asset, why = uncRun("images", "getcustomasset", false, path)
 		if ok and type(asset) == "string" and asset ~= "" then
 			done(asset)
+		elseif ok then
+			uncRecord("images", "getcustomasset", "silent", nil, "it returned " .. type(asset) .. " for " .. path)
+			done(nil, "could not load the image: executor function 'getcustomasset' returned nothing for the saved file")
 		else
-			done(nil, "could not load the image")
+			done(nil, "could not load the image: " .. tostring(why))
 		end
 	end)
 end
@@ -2202,6 +2363,9 @@ function Library.new(options)
 	self.Minimized = false
 	self._hotkeys = {}
 	self._hotkeyIds = {}
+	self._states = {}
+	self._stateIds = {}
+	self._presetFire = options.PresetCallbacks ~= false -- loading a preset runs the callbacks of what changed (default)
 	self._keepOnScreen = options.KeepOnScreen ~= false
 	self._showChips = options.Hotkeys ~= false -- Hotkeys = false hides the hotkey boxes (code-set Hotkey keys still work)
 
@@ -3129,6 +3293,18 @@ function Tab:Toggle(text, default, callback, opts)
 	end)
 	win:_attachTip(btn, opts.Tooltip)
 
+	win:_addState(self, "t", text, {
+		get = function()
+			return state and "1" or "0"
+		end,
+		set = function(v, fire)
+			if v ~= "1" and v ~= "0" then
+				return false
+			end
+			obj:Set(v == "1", not fire) -- the callback only runs when the value really changes
+			return true
+		end,
+	})
 	return obj
 end
 
@@ -3293,6 +3469,19 @@ function Tab:Slider(text, min, max, default, callback, opts)
 	win:_attachTip(card, opts.Tooltip)
 
 	render()
+	win:_addState(self, "s", text, {
+		get = function()
+			return string.format("%.6f", value)
+		end,
+		set = function(v, fire)
+			v = tonumber(v)
+			if not v or v ~= v or v == math.huge or v == -math.huge then
+				return false
+			end
+			apply(v, not fire)
+			return true
+		end,
+	})
 	return obj
 end
 
@@ -3347,6 +3536,22 @@ function Tab:Input(text, placeholder, callback, opts)
 	end)
 	win:_attachTip(card, opts.Tooltip)
 
+	win:_addState(self, "i", text, {
+		get = function()
+			return box.Text
+		end,
+		set = function(v, fire)
+			if type(v) ~= "string" then
+				return false
+			end
+			local changed = box.Text ~= v
+			box.Text = v
+			if changed and fire then
+				runGated(win, callback, v)
+			end
+			return true
+		end,
+	})
 	return {
 		Instance = row,
 		Get = function()
@@ -3473,6 +3678,7 @@ function Tab:Dropdown(text, list, callback, opts)
 	local items = {}
 	local buttons = {}
 	local open = false
+	local selected = nil -- last option chosen by the user or by Set / a preset
 	local row = self:_row(ROW, "Dropdown")
 	local card = create("Frame", {
 		Name = "Card",
@@ -3583,6 +3789,7 @@ function Tab:Dropdown(text, list, callback, opts)
 				tween(b, 0.1, { BackgroundColor3 = theme.Background })
 			end)
 			win:_connect(b.Activated, function()
+				selected = items[index]
 				valueLabel.Text = items[index]
 				setOpen(false)
 				runGated(win, callback, items[index])
@@ -3605,6 +3812,39 @@ function Tab:Dropdown(text, list, callback, opts)
 	win:_attachTip(head, opts.Tooltip)
 	rebuild(type(list) == "table" and list or {})
 
+	-- choose(option, silent): picks an option that is in the list; the callback runs only when it changes
+	local function choose(option, silent)
+		option = tostring(option)
+		local found = false
+		for _, item in ipairs(items) do
+			if item == option then
+				found = true
+				break
+			end
+		end
+		if not found then
+			return false
+		end
+		local changed = selected ~= option
+		selected = option
+		valueLabel.Text = option
+		if changed and not silent then
+			runGated(win, callback, option)
+		end
+		return true
+	end
+
+	win:_addState(self, "d", text, {
+		get = function()
+			return selected
+		end,
+		set = function(v, fire)
+			if type(v) ~= "string" then
+				return false
+			end
+			return choose(v, not fire)
+		end,
+	})
 	return {
 		Instance = row,
 		Refresh = function(_, newList)
@@ -3613,6 +3853,13 @@ function Tab:Dropdown(text, list, callback, opts)
 				return
 			end
 			rebuild(newList)
+		end,
+		Get = function()
+			return selected
+		end,
+		-- Set(option, silent): silent = true skips the callback. Returns false when the option is not in the list.
+		Set = function(_, option, silent)
+			return choose(option, silent)
 		end,
 	}
 end
@@ -3672,7 +3919,7 @@ function Tab:ColorPicker(text, default, callback, opts)
 		BorderSizePixel = 0,
 		Parent = card,
 	}, { listLayout(6) })
-	local host = setmetatable({ Window = win, Name = "ColorPanel", Page = panel, _order = 0 }, Tab)
+	local host = setmetatable({ Window = win, Name = "ColorPanel", Page = panel, _order = 0, _noState = true }, Tab)
 
 	local function push()
 		color = Color3.fromRGB(r, g, b)
@@ -3698,7 +3945,7 @@ function Tab:ColorPicker(text, default, callback, opts)
 	end)
 	win:_attachTip(head, opts.Tooltip)
 
-	return {
+	local picker = {
 		Instance = row,
 		Get = function()
 			return color
@@ -3719,6 +3966,23 @@ function Tab:ColorPicker(text, default, callback, opts)
 			end
 		end,
 	}
+	win:_addState(self, "c", text, {
+		get = function()
+			return string.format("%02x%02x%02x", r, g, b)
+		end,
+		set = function(v, fire)
+			local c = type(v) == "string" and string.match(v, "^%x%x%x%x%x%x$") and Color3.fromRGB(tonumber(string.sub(v, 1, 2), 16), tonumber(string.sub(v, 3, 4), 16), tonumber(string.sub(v, 5, 6), 16))
+			if not c then
+				return false
+			end
+			if math.floor(c.R * 255 + 0.5) == r and math.floor(c.G * 255 + 0.5) == g and math.floor(c.B * 255 + 0.5) == b then
+				return true -- already this colour: nothing changes, no callback
+			end
+			picker:Set(c, not fire)
+			return true
+		end,
+	})
+	return picker
 end
 
 ----------------------------------------------------------------------
@@ -3741,7 +4005,54 @@ local function fromHex(h)
 	return Color3.fromRGB(tonumber(string.sub(h, 1, 2), 16), tonumber(string.sub(h, 3, 4), 16), tonumber(string.sub(h, 5, 6), 16))
 end
 
--- Look code: "NVP1;S=rrggbb;B=..;H=..;T=..;E=..;K=1[;G=<background code>]". Pure text, safe to paste around.
+local PRESET_MAX_CODE = 24000
+local PRESET_MAX_ENTRIES = 400
+
+-- percent-encoding that leaves only letters, digits and - . _ ~ (so , : ; = | never appear inside a value)
+local function escField(s)
+	return (string.gsub(tostring(s), "[^%w%-%._~]", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
+end
+
+local function unescField(s)
+	return (string.gsub(tostring(s), "%%(%x%x)", function(h)
+		return string.char(tonumber(h, 16))
+	end))
+end
+
+-- What a preset remembers about the elements the script put in the window:
+--   hotkeys  Y=id:Key,id:-          every Button / Toggle / Keybind hotkey ("-" = no key)
+--   values   U=id:t:1,id:s:42.5,..  Toggle (t), Slider (s), Input (i), Dropdown (d), Colour (c)
+function Library:_captureState()
+	local y, u = {}, {}
+	for _, hk in ipairs(self._hotkeys) do
+		if #y < PRESET_MAX_ENTRIES then
+			local name = "-"
+			if hk.key then
+				local okName, n = pcall(function()
+					return hk.key.Name
+				end)
+				if okName and type(n) == "string" and string.match(n, "^%w+$") then
+					name = n
+				end
+			end
+			table.insert(y, escField(hk.id) .. ":" .. name)
+		end
+	end
+	for _, st in ipairs(self._states) do
+		if #u < PRESET_MAX_ENTRIES then
+			local okGet, v = pcall(st.get)
+			if okGet and type(v) == "string" then
+				table.insert(u, escField(st.id) .. ":" .. st.kind .. ":" .. escField(v))
+			end
+		end
+	end
+	return table.concat(y, ","), table.concat(u, ",")
+end
+
+-- Look code: "NVP1;S=rrggbb;B=..;H=..;T=..;E=..;K=1[;G=<background code>|-][;Y=hotkeys][;U=values]".
+-- Pure text, safe to paste around. Old codes without G / Y / U still load; fields missing = left alone.
 local function encodeLook(win)
 	local parts = { "NVP1" }
 	for _, key in ipairs(SCHEME_KEYS) do
@@ -3752,9 +4063,49 @@ local function encodeLook(win)
 		local g = win:_bgEncode()
 		if g and g ~= "" then
 			table.insert(parts, "G=" .. g)
+		elseif win._bg == nil then
+			table.insert(parts, "G=-") -- no background: loading this preset removes the current one
 		end
 	end
+	local y, u = win:_captureState()
+	if y ~= "" then
+		table.insert(parts, "Y=" .. y)
+	end
+	if u ~= "" then
+		table.insert(parts, "U=" .. u)
+	end
 	return table.concat(parts, ";")
+end
+
+local function parseHotkeyField(v)
+	local list = {}
+	for item in string.gmatch(v, "[^,]+") do
+		if #list >= PRESET_MAX_ENTRIES then
+			break
+		end
+		local id, key = string.match(item, "^([^:]+):(%w+)$")
+		if not id then
+			id, key = string.match(item, "^([^:]+):(%-)$")
+		end
+		if id then
+			table.insert(list, { id = unescField(id), key = key ~= "-" and key or nil })
+		end
+	end
+	return list
+end
+
+local function parseValueField(v)
+	local list = {}
+	for item in string.gmatch(v, "[^,]+") do
+		if #list >= PRESET_MAX_ENTRIES then
+			break
+		end
+		local id, kind, value = string.match(item, "^([^:]+):(%a):([^:]*)$")
+		if id then
+			table.insert(list, { id = unescField(id), kind = kind, value = unescField(value) })
+		end
+	end
+	return list
 end
 
 local function decodeLook(code)
@@ -3763,7 +4114,7 @@ local function decodeLook(code)
 	end
 	code = string.gsub(code, "^%s+", "")
 	code = string.gsub(code, "%s+$", "")
-	if #code > 4000 then
+	if #code > PRESET_MAX_CODE then
 		return nil, "too long"
 	end
 	local fields = {}
@@ -3790,6 +4141,10 @@ local function decodeLook(code)
 				look.keep = v ~= "0"
 			elseif k == "G" then
 				look.bg = v
+			elseif k == "Y" then
+				look.hotkeys = parseHotkeyField(v)
+			elseif k == "U" then
+				look.states = parseValueField(v)
 			end
 		end
 	end
@@ -3808,45 +4163,53 @@ local function presets()
 		return presetStore
 	end
 	presetStore = { names = {}, codes = {} }
-	local read = envFn(function() return readfile end)
-	local exists = envFn(function() return isfile end)
-	if read and exists then
-		local ok, text = pcall(function()
-			if exists(PRESET_FILE) then
-				return read(PRESET_FILE)
+	-- no file yet is normal (first run); only a function that exists but throws is blamed on the executor
+	local text = nil
+	local okExists, exists = uncRun("presets", "isfile", true, PRESET_FILE)
+	if okExists and exists == false then
+		return presetStore
+	end
+	if okExists or not uncFn("isfile") then
+		local read = uncFn("readfile")
+		if read then
+			local okRead, body
+			if okExists then
+				okRead, body = uncRun("presets", "readfile", true, PRESET_FILE)
+			else
+				okRead, body = pcall(read, PRESET_FILE) -- isfile is missing: a failed read just means no file yet
 			end
-		end)
-		if ok and type(text) == "string" then
-			for line in string.gmatch(text, "[^\r\n]+") do
-				local name, code = string.match(line, "^([^\t]+)\t(.+)$")
-				if name and #presetStore.names < PRESET_MAX and decodeLook(code) then
-					if not presetStore.codes[name] then
-						table.insert(presetStore.names, name)
-					end
-					presetStore.codes[name] = code
+			if okRead and type(body) == "string" then
+				text = body
+			end
+		end
+	end
+	if text then
+		for line in string.gmatch(text, "[^\r\n]+") do
+			local name, code = string.match(line, "^([^\t]+)\t(.+)$")
+			if name and #presetStore.names < PRESET_MAX and decodeLook(code) then
+				if not presetStore.codes[name] then
+					table.insert(presetStore.names, name)
 				end
+				presetStore.codes[name] = code
 			end
 		end
 	end
 	return presetStore
 end
 
+-- returns true, or false + a plain-words reason that names the executor function at fault
 local function persistPresets()
-	local write, mk, isf = envFn(function() return writefile end), envFn(function() return makefolder end), envFn(function() return isfolder end)
-	if not write then
-		return false
-	end
 	local store = presets()
 	local lines = {}
 	for _, name in ipairs(store.names) do
 		table.insert(lines, name .. "\t" .. store.codes[name])
 	end
-	return (pcall(function()
-		if mk and not (isf and isf("NovaUI")) then
-			mk("NovaUI")
-		end
-		write(PRESET_FILE, table.concat(lines, "\n"))
-	end))
+	local okFolder, hasFolder = uncRun("presets", "isfolder", true, "NovaUI")
+	if not (okFolder and hasFolder) then
+		uncRun("presets", "makefolder", true, "NovaUI") -- a failure is recorded; writefile below says whether it mattered
+	end
+	local ok, _, why = uncRun("presets", "writefile", false, PRESET_FILE, table.concat(lines, "\n"))
+	return ok, why
 end
 
 local function cleanPresetName(text)
@@ -3857,6 +4220,77 @@ local function cleanPresetName(text)
 	return string.sub(text, 1, PRESET_MAX_NAME)
 end
 
+-- Puts the saved hotkeys and element values back. Elements are matched by "Tab/Label" (+ " #2" for twins);
+-- anything the preset does not mention is left alone, anything it mentions that is gone is counted.
+-- Hotkeys are cleared first and re-bound second, so two hotkeys can swap keys inside one preset.
+function Library:_applyElements(look)
+	local stats = { keys = 0, values = 0, missing = 0, keyConflicts = 0 }
+	if look.hotkeys then
+		local byId = {}
+		for _, hk in ipairs(self._hotkeys) do
+			byId[hk.id] = hk
+		end
+		local plan, planned = {}, {}
+		for _, item in ipairs(look.hotkeys) do
+			local hk = byId[item.id]
+			if hk and planned[hk] then
+				hk = nil -- the same id twice in one code: the first entry wins
+			elseif hk then
+				planned[hk] = true
+			end
+			if not hk then
+				stats.missing = stats.missing + 1
+			elseif item.key == nil then
+				table.insert(plan, { hk = hk, prev = hk.key, code = nil })
+			else
+				local okKey, code = pcall(function()
+					return Enum.KeyCode[item.key]
+				end)
+				if okKey and isKeyCode(code) and code ~= Enum.KeyCode.Unknown then
+					table.insert(plan, { hk = hk, prev = hk.key, code = code })
+				else
+					stats.keyConflicts = stats.keyConflicts + 1
+				end
+			end
+		end
+		for _, p in ipairs(plan) do
+			p.hk:SetKey(nil, true)
+		end
+		for _, p in ipairs(plan) do
+			local final = p.code
+			if final and self:_keyTaken(final, p.hk) then
+				stats.keyConflicts = stats.keyConflicts + 1
+				final = (p.prev and not self:_keyTaken(p.prev, p.hk)) and p.prev or nil
+			end
+			p.hk:SetKey(final, final == p.prev) -- tell OnHotkeyChanged only when the key really changed
+			if final == p.code then
+				stats.keys = stats.keys + 1
+			end
+		end
+	end
+	if look.states then
+		local byKey = {}
+		for _, st in ipairs(self._states) do
+			byKey[st.kind .. "\0" .. st.id] = st
+		end
+		for _, item in ipairs(look.states) do
+			local st = byKey[item.kind .. "\0" .. item.id]
+			if not st then
+				stats.missing = stats.missing + 1
+			else
+				local okSet, applied = pcall(st.set, item.value, self._presetFire)
+				if okSet and applied then
+					stats.values = stats.values + 1
+				else
+					stats.missing = stats.missing + 1
+				end
+			end
+		end
+	end
+	return stats
+end
+
+-- returns a short plain-words summary of what was restored, e.g. "7 settings, 3 hotkeys (2 not found in this script)"
 function Library:_applyLook(look)
 	Library._recolor(self, look.scheme)
 	if look.keep ~= nil then
@@ -3865,12 +4299,28 @@ function Library:_applyLook(look)
 			self:_settle(self._main)
 		end
 	end
-	if look.bg and self._bgDecode then
+	if look.bg == "-" then
+		if self.ClearBackground then
+			self:ClearBackground()
+		end
+	elseif look.bg and self._bgDecode then
 		self:_bgDecode(look.bg)
 	end
+	local stats = self:_applyElements(look)
 	if self._syncSettings then
 		self:_syncSettings()
 	end
+	if not (look.hotkeys or look.states) then
+		return ""
+	end
+	local text = stats.values .. " settings, " .. stats.keys .. " hotkeys restored"
+	if stats.missing > 0 then
+		text = text .. ", " .. stats.missing .. " not found in this script"
+	end
+	if stats.keyConflicts > 0 then
+		text = text .. ", " .. stats.keyConflicts .. " hotkeys skipped (key already used)"
+	end
+	return text
 end
 
 function Library:IsSettingsOpen()
@@ -3905,7 +4355,7 @@ function Library:_buildSettings()
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		Parent = panel,
 	}, { listLayout(8), padding(16, 12, 18, 14) })
-	local host = setmetatable({ Window = self, Name = "Settings", Page = page, _order = 0 }, Tab)
+	local host = setmetatable({ Window = self, Name = "Settings", Page = page, _order = 0, _noState = true }, Tab)
 	local S = { panel = panel, page = page, host = host, pickers = {} }
 	self._settings = S
 
@@ -3954,8 +4404,8 @@ function Library:_buildSettings()
 		local code = presets().codes[name]
 		local look = code and decodeLook(code)
 		if look then
-			win:_applyLook(look)
-			S.status:Set("Loaded '" .. name .. "'")
+			local summary = win:_applyLook(look)
+			S.status:Set("Loaded '" .. name .. "'" .. (summary ~= "" and (": " .. summary) or ""))
 		end
 	end)
 	function S.refreshPresets()
@@ -3978,8 +4428,8 @@ function Library:_buildSettings()
 		store.codes[name] = encodeLook(win)
 		selected = name
 		S.refreshPresets()
-		local saved = persistPresets()
-		S.status:Set("Saved '" .. name .. "'" .. (saved and " (kept on disk)" or " (this session only: your executor has no file access)"))
+		local saved, why = persistPresets()
+		S.status:Set("Saved '" .. name .. "'" .. (saved and " (kept on disk)" or (" (this session only: " .. tostring(why or "your executor has no file access") .. ")")))
 	end)
 	host:Button("Delete selected preset", function()
 		local store = presets()
@@ -4001,8 +4451,7 @@ function Library:_buildSettings()
 	end)
 	host:Button("Export look (copy code)", function()
 		local code = encodeLook(win)
-		local clip = envFn(function() return setclipboard end) or envFn(function() return toclipboard end)
-		local copied = clip ~= nil and pcall(clip, code)
+		local copied = uncRun("export", "setclipboard", false, code) -- also tries toclipboard
 		S.codeInput:Set(code)
 		S.status:Set(copied and "Look code copied to your clipboard." or "Look code is in the box below: copy it from there.")
 	end)
@@ -4012,8 +4461,8 @@ function Library:_buildSettings()
 			S.status:Set("Could not import: " .. tostring(err))
 			return
 		end
-		win:_applyLook(look)
-		S.status:Set("Imported look.")
+		local summary = win:_applyLook(look)
+		S.status:Set("Imported look" .. (summary ~= "" and (": " .. summary) or "."))
 	end)
 
 	host:Section("Window")
@@ -4023,13 +4472,17 @@ function Library:_buildSettings()
 			win:_settle(win._main)
 		end
 	end, { Hotkey = false })
-	host:Button("Centre window", function()
-		tween(win._main, 0.35, { Position = UDim2.fromScale(0.5, 0.5) }, STYLE_QUART)
-	end, { Hotkey = false })
 
 	if win._buildBackgroundSettings then
 		win:_buildBackgroundSettings(host, S)
 	end
+
+	host:Section("Executor check")
+	S.uncStatus = host:Label("Checks the file and asset functions of your executor (UNC). Details go to the console.")
+	host:Button("Run executor check", function()
+		local report = Library.UNCTest({ Quiet = false })
+		S.uncStatus:Set(report.Summary)
+	end, { Hotkey = false })
 	return S
 end
 
@@ -4130,7 +4583,7 @@ local function resolveVideo(src, done)
 		return done(nil, "invalid asset id")
 	end
 	if type(src) ~= "string" or src == "" then
-		return done(nil, "Video must be an asset id or an https link")
+		return done(nil, "Video must be an asset id, an https link, or a file name from workspace/NovaUI/backgrounds")
 	end
 	if string.match(src, "^%d+$") then
 		return done("rbxassetid://" .. src)
@@ -4138,41 +4591,32 @@ local function resolveVideo(src, done)
 	if string.match(src, "^rbxassetid://%d+$") then
 		return done(src)
 	end
+	local localPath, localKind = localBgFile(src)
+	if localPath then
+		if localKind ~= "video" then
+			return done(nil, "that file is an image, not a video")
+		end
+		return resolveLocalFile(localPath, done)
+	end
 	if not string.match(src, "^https?://[%w%-%._~:/%?#@!$&'()*+,;=%%]+$") or #src > 2000 then
-		return done(nil, "unsupported video source (use an asset id or an http/https link)")
+		return done(nil, "unsupported video source (use an asset id, an http/https link, or a file name from workspace/NovaUI/backgrounds)")
 	end
-	local writeFile = envFn(function()
-		return writefile
-	end)
-	local getAsset = envFn(function()
-		return getcustomasset
-	end) or envFn(function()
-		return getsynasset
-	end)
-	if not writeFile or not getAsset then
-		return done(nil, "this executor can't play videos from links (needs writefile + getcustomasset); upload it and use an rbxassetid")
+	if not uncFn("writefile") or not uncFn("getcustomasset") then
+		return done(nil, "this executor can't play videos from links (needs writefile + getcustomasset); put the file in workspace/NovaUI/backgrounds or use an rbxassetid")
 	end
-	local isFile = envFn(function()
-		return isfile
-	end)
-	local makeFolder = envFn(function()
-		return makefolder
-	end)
 	local base = "NovaUI/vid_" .. string.sub(sha256(src), 1, 24)
 	task.spawn(function()
 		local path = nil
-		if isFile then
-			for _, ext in ipairs({ "webm", "mp4" }) do
-				local ok, exists = pcall(isFile, base .. "." .. ext)
-				if ok and exists then
-					path = base .. "." .. ext
-				end
+		for _, ext in ipairs({ "webm", "mp4" }) do
+			local ok, exists = uncRun("videos", "isfile", true, base .. "." .. ext)
+			if ok and exists then
+				path = base .. "." .. ext
 			end
 		end
 		if not path then
-			local data = downloadImage(src)
+			local data, why = downloadImage(src)
 			if not data then
-				return done(nil, "download failed")
+				return done(nil, "download failed (" .. tostring(why) .. ")")
 			end
 			if #data > MAX_VIDEO_BYTES then
 				return done(nil, "video too large (max 40 MB)")
@@ -4181,19 +4625,24 @@ local function resolveVideo(src, done)
 			if not kind then
 				return done(nil, "not a .webm or .mp4 video")
 			end
-			if makeFolder then
-				pcall(makeFolder, "NovaUI")
+			local okFolder, hasFolder = uncRun("videos", "isfolder", true, "NovaUI")
+			if not (okFolder and hasFolder) then
+				uncRun("videos", "makefolder", true, "NovaUI")
 			end
 			path = base .. "." .. kind
-			if not pcall(writeFile, path, data) then
-				return done(nil, "could not save the video")
+			local okWrite, _, whyWrite = uncRun("videos", "writefile", false, path, data)
+			if not okWrite then
+				return done(nil, "could not save the video: " .. tostring(whyWrite))
 			end
 		end
-		local ok, asset = pcall(getAsset, path)
+		local ok, asset, why = uncRun("videos", "getcustomasset", false, path)
 		if ok and type(asset) == "string" and asset ~= "" then
 			done(asset)
+		elseif ok then
+			uncRecord("videos", "getcustomasset", "silent", nil, "it returned " .. type(asset) .. " for " .. path)
+			done(nil, "could not load the video: executor function 'getcustomasset' returned nothing for the saved file")
 		else
-			done(nil, "could not load the video")
+			done(nil, "could not load the video: " .. tostring(why))
 		end
 	end)
 end
@@ -4571,6 +5020,12 @@ function Library:SetBackground(spec)
 		warn("[NovaUI] SetBackground: give Video, Image or Pixels")
 		return false
 	end
+	if kind ~= "pixels" then
+		local fullPath = localBgFile(source)
+		if fullPath then
+			source = fullPath -- "intro.webm" is remembered (and saved in presets) as NovaUI/backgrounds/intro.webm
+		end
+	end
 	local map = nil
 	if spec.ColorMap ~= nil then
 		if validMap(spec.ColorMap) then
@@ -4627,6 +5082,22 @@ function Library:SetBackground(spec)
 			v.Playing = true
 			pcall(function()
 				v:Play()
+			end)
+			-- Roblox plays only some codecs: say so when the video has not loaded after 10 seconds
+			task.delay(10, function()
+				if self._destroyed or self._bgToken ~= token or self._bgVideo ~= v then
+					return
+				end
+				local okLoaded, loaded = pcall(function()
+					return v.IsLoaded
+				end)
+				if okLoaded and loaded == false then
+					state.note = "Roblox has not loaded this video after 10 s. If the window stays plain, convert it to .webm (VP8 or VP9, up to 720p, no audio, under 40 MB)."
+					warn("[NovaUI] background: " .. state.note)
+					if self._bgStatus then
+						self._bgStatus("slow")
+					end
+				end
 			end)
 		elseif kind == "image" then
 			self._bgMedia = create("ImageLabel", {
@@ -4796,15 +5267,82 @@ end
 function Library:_buildBackgroundSettings(host, S)
 	local win = self
 	host:Section("Background  (video / image)")
-	S.bgNote = host:Label("Put a looping video or picture behind the window. Text and buttons stay readable.")
+	S.bgNote = host:Label("Easiest: drop a .webm / .mp4 / .png / .jpg into workspace/" .. BG_FOLDER .. ", press Refresh, pick it below.")
+
+	-- the folder: created on demand, listed through the executor's listfiles
+	local function ensureFolder(path)
+		local okF, has = uncRun("background folder", "isfolder", true, path)
+		if not (okF and has) then
+			uncRun("background folder", "makefolder", true, path)
+		end
+	end
+	local function listBgFiles()
+		local names = {}
+		if not uncFn("listfiles") then
+			return names, "this executor has no listfiles: type the file name in Source instead"
+		end
+		ensureFolder("NovaUI")
+		ensureFolder(BG_FOLDER)
+		local ok, list, why = uncRun("background folder", "listfiles", false, BG_FOLDER)
+		if not ok then
+			return names, why
+		end
+		if type(list) ~= "table" then
+			return names, "executor function 'listfiles' returned " .. type(list) .. " instead of a list"
+		end
+		local seen = {}
+		for _, entry in ipairs(list) do
+			local name = string.match(tostring(entry), "([^/\\]+)$")
+			if name and not seen[name] and localBgFile(name) and #names < 100 then
+				seen[name] = true
+				table.insert(names, name)
+			end
+		end
+		table.sort(names, function(a, b)
+			return string.lower(a) < string.lower(b)
+		end)
+		return names
+	end
+	local function useFile(name)
+		local path, fileKind = localBgFile(name)
+		if not path then
+			S.bgNote:Set("That is not a usable file name (letters, digits, space - . _ ( ) and .webm .mp4 .png .jpg).")
+			return
+		end
+		local spec = { Dim = win._bg and win._bg.dim, Glass = win._bg and win._bg.glass }
+		spec[fileKind == "video" and "Video" or "Image"] = path
+		win:SetBackground(spec)
+		S.bgNote:Set("Loading " .. name .. "...")
+	end
+	S.bgFiles = host:Dropdown("Files in folder", {}, function(name)
+		useFile(name)
+	end)
+	function S.refreshFiles()
+		local names, why = listBgFiles()
+		S.bgFiles:Refresh(names)
+		if why then
+			S.bgNote:Set("Could not list the folder: " .. tostring(why))
+		elseif #names == 0 then
+			S.bgNote:Set("No files yet. Put a .webm / .mp4 / .png / .jpg in workspace/" .. BG_FOLDER .. ", then press Refresh files.")
+		else
+			S.bgNote:Set(#names .. " file(s) found in workspace/" .. BG_FOLDER .. ". Pick one in 'Files in folder'.")
+		end
+	end
+	host:Button("Refresh files", function()
+		S.refreshFiles()
+	end, { Hotkey = false })
+
 	local kindNow = "Video"
-	S.bgType = host:Dropdown("Type", { "Video", "Image" }, function(v)
+	S.bgType = host:Dropdown("Type (for links / ids)", { "Video", "Image" }, function(v)
 		kindNow = v
 	end)
-	S.bgSource = host:Input("Source", "asset id or https link, press Enter", function(text)
+	S.bgSource = host:Input("Source", "file name, asset id or https link, press Enter", function(text)
 		text = trimText(text)
 		if text == "" then
 			return
+		end
+		if localBgFile(text) then
+			return useFile(string.match(text, "([^/]+)$"))
 		end
 		local spec = { Dim = win._bg and win._bg.dim, Glass = win._bg and win._bg.glass }
 		local source = string.match(text, "^%d+$") and tonumber(text) or text
@@ -4847,8 +5385,11 @@ function Library:_buildBackgroundSettings(host, S)
 			S.bgNote:Set("Could not load it (" .. string.sub(status, 9) .. ")")
 		elseif status == "ready" then
 			S.bgNote:Set("Background ready.")
+		elseif status == "slow" then
+			S.bgNote:Set(win._bg and win._bg.note or "Roblox is still loading the video.")
 		end
 	end
+	S.refreshFiles()
 end
 
 function Library:_bgSync()
@@ -5098,6 +5639,321 @@ end
 
 function Section:NewColorPicker(name, info, default, callback)
 	self._tab:ColorPicker(name, default, callback, { Tooltip = tipFor(name, info) })
+end
+
+----------------------------------------------------------------------
+-- Executor (UNC) check. Library.UNCTest() runs the executor functions NovaUI relies on, one by one,
+-- and says for each: PASS, FAIL (exists but broken), MISSING or SKIP, with the reason in plain words.
+-- A FAIL here is the executor's problem (its UNC implementation), never NovaUI's code.
+-- Options: Quiet = true (no printing), Print = function (default print).
+----------------------------------------------------------------------
+function Library.UNCTest(options)
+	options = options or {}
+	local out = options.Print or print
+	local results, counts, byName, created = {}, { PASS = 0, FAIL = 0, MISSING = 0, SKIP = 0 }, {}, {}
+	local function add(name, status, note, optional)
+		local r = { Name = name, Status = status, Note = note, Optional = optional == true }
+		table.insert(results, r)
+		byName[name] = r
+		counts[status] = counts[status] + 1
+		if options.Quiet ~= true then
+			out("[NovaUI UNC] " .. status .. string.rep(" ", 8 - #status) .. name .. " - " .. note)
+		end
+	end
+	-- returns "missing" | "error", raw, hint, usedName | "ok", value
+	local function call(name, ...)
+		local fn, used = uncFn(name)
+		if not fn then
+			return "missing"
+		end
+		local ok, v = pcall(fn, ...)
+		if not ok then
+			return "error", v, uncHint(v), used
+		end
+		return "ok", v, nil, used
+	end
+	local function failed(name, kind, raw, hint, used, optional)
+		if kind == "missing" then
+			add(name, "MISSING", "this executor has no '" .. name .. "' function" .. (optional and " (optional)" or ""), optional)
+		else
+			add(name, "FAIL", "executor function '" .. tostring(used or name) .. "' raised an error: " .. tostring(hint) .. ". Raw error: " .. tostring(raw), optional)
+		end
+	end
+	local function baseName(path)
+		return string.match(tostring(path), "([^/\\]+)$") or tostring(path)
+	end
+
+	-- plain presence / sanity checks
+	do
+		local kind, v, hint, used = call("getgenv")
+		if kind == "ok" and type(v) == "table" then
+			add("getgenv", "PASS", "returns the executor's global table")
+		elseif kind == "ok" then
+			add("getgenv", "FAIL", "getgenv() did not return a table (got " .. type(v) .. ")")
+		else
+			failed("getgenv", kind, v, hint, used)
+		end
+	end
+	do
+		local kind, v, hint, used = call("loadstring", "return 41 + 1")
+		if kind == "ok" and type(v) == "function" then
+			local okRun, value = pcall(v)
+			if okRun and value == 42 then
+				add("loadstring", "PASS", "compiles and runs a test chunk")
+			else
+				add("loadstring", "FAIL", "loadstring compiled a chunk but running it gave the wrong result")
+			end
+		elseif kind == "ok" then
+			add("loadstring", "FAIL", "loadstring returned " .. type(v) .. " instead of a function (the executor may block loadstring)")
+		else
+			failed("loadstring", kind, v, hint, used)
+		end
+	end
+	do
+		local okGame, hasGet = pcall(function()
+			return typeof(game.HttpGet) == "function"
+		end)
+		if okGame and hasGet then
+			add("HttpGet", "PASS", "game:HttpGet exists (not called, so no network is used)")
+		else
+			add("HttpGet", "MISSING", "game:HttpGet is not available, so loadstring(game:HttpGet(url)) cannot work on this executor")
+		end
+	end
+	do
+		local kind = call("request")
+		if kind == "missing" then
+			add("request", "MISSING", "no request / http_request function (optional: NovaUI falls back to game:HttpGet)", true)
+		else
+			add("request", "PASS", "request / http_request exists (not called)", true)
+		end
+	end
+	do
+		local kind = call("setclipboard")
+		if kind == "missing" then
+			add("setclipboard", "MISSING", "no setclipboard / toclipboard (optional: the look code is shown in a box instead)", true)
+		else
+			add("setclipboard", "PASS", "setclipboard / toclipboard exists (not called, so your clipboard is untouched)", true)
+		end
+	end
+	do
+		local okHui, ui = pcall(function()
+			return gethui and gethui()
+		end)
+		if okHui and ui then
+			add("gethui", "PASS", "returns a hidden GUI container", true)
+		else
+			add("gethui", "MISSING", "no gethui (optional: NovaUI uses CoreGui or PlayerGui instead)", true)
+		end
+	end
+
+	-- file system: folder, text, binary, listing
+	local DIR = "NovaUI"
+	local TXT, BIN, PNG, WEBM, MP4 = DIR .. "/_unc_test.txt", DIR .. "/_unc_test.bin", DIR .. "/_unc_test.png", DIR .. "/_unc_test.webm", DIR .. "/_unc_test.mp4"
+	do
+		local kind, v, hint, used = call("isfolder", DIR)
+		local existed = kind == "ok" and v == true
+		if kind ~= "ok" then
+			failed("isfolder", kind, v, hint, used)
+		end
+		if existed then
+			add("isfolder", "PASS", "sees the '" .. DIR .. "' folder")
+			add("makefolder", "SKIP", "not needed: '" .. DIR .. "' already exists")
+		else
+			local mk, raw, mkHint, mkUsed = call("makefolder", DIR)
+			if mk ~= "ok" then
+				failed("makefolder", mk, raw, mkHint, mkUsed)
+			else
+				local again, there = call("isfolder", DIR)
+				if again == "ok" and there == true then
+					add("makefolder", "PASS", "created '" .. DIR .. "'")
+					if kind == "ok" then
+						add("isfolder", "PASS", "sees the folder makefolder just created")
+					end
+				elseif again == "ok" then
+					add("makefolder", "FAIL", "makefolder ran without error but isfolder still says '" .. DIR .. "' does not exist (executor bug)")
+				else
+					add("makefolder", "PASS", "ran without error (isfolder is unavailable to confirm it)")
+				end
+			end
+		end
+	end
+
+	local function put(path, data)
+		local kind, raw, hint, used = call("writefile", path, data)
+		if kind == "ok" then
+			table.insert(created, path)
+		end
+		return kind, raw, hint, used
+	end
+
+	local textBody = "hello NovaUI"
+	local wrote = false
+	do
+		local kind, raw, hint, used = put(TXT, textBody)
+		if kind == "ok" then
+			wrote = true
+			add("writefile", "PASS", "wrote a text file into '" .. DIR .. "'")
+		else
+			failed("writefile", kind, raw, hint, used)
+		end
+	end
+	if not wrote then
+		add("isfile", "SKIP", "needs writefile to work first")
+		add("readfile", "SKIP", "needs writefile to work first")
+		add("readfile (binary)", "SKIP", "needs writefile to work first")
+		add("listfiles", "SKIP", "needs writefile to work first")
+	else
+		do
+			local kind, v, hint, used = call("isfile", TXT)
+			if kind == "ok" and v == true then
+				add("isfile", "PASS", "sees the file writefile created")
+			elseif kind == "ok" then
+				add("isfile", "FAIL", "isfile returned " .. tostring(v) .. " for a file writefile just created (executor bug)")
+			else
+				failed("isfile", kind, v, hint, used)
+			end
+		end
+		do
+			local kind, v, hint, used = call("readfile", TXT)
+			if kind == "ok" and v == textBody then
+				add("readfile", "PASS", "reads back exactly what was written")
+			elseif kind == "ok" then
+				add("readfile", "FAIL", "readfile returned different text than writefile stored (executor bug)")
+			else
+				failed("readfile", kind, v, hint, used)
+			end
+		end
+		do
+			local bytes = "\0\1\2\255\254\r\n\26\0" .. string.rep("\200", 64)
+			local wk, raw, hint, used = put(BIN, bytes)
+			if wk ~= "ok" then
+				failed("readfile (binary)", wk, raw, hint, used)
+			else
+				local kind, v, rh, ru = call("readfile", BIN)
+				if kind == "ok" and v == bytes then
+					add("readfile (binary)", "PASS", "binary data survives a write and read (needed for images and videos)")
+				elseif kind == "ok" then
+					add("readfile (binary)", "FAIL", "binary data came back changed (" .. tostring(type(v) == "string" and #v or type(v)) .. " bytes instead of " .. #bytes .. "): the executor mangles non-text files")
+				else
+					failed("readfile (binary)", kind, v, rh, ru)
+				end
+			end
+		end
+		do
+			local kind, v, hint, used = call("listfiles", DIR)
+			if kind == "ok" and type(v) == "table" then
+				local found = false
+				for _, entry in ipairs(v) do
+					if baseName(entry) == "_unc_test.txt" then
+						found = true
+					end
+				end
+				if found then
+					add("listfiles", "PASS", "lists files in '" .. DIR .. "' (needed for the background picker)")
+				else
+					add("listfiles", "FAIL", "listfiles('" .. DIR .. "') did not include the file just written (executor bug)")
+				end
+			elseif kind == "ok" then
+				add("listfiles", "FAIL", "listfiles returned " .. type(v) .. " instead of a table")
+			else
+				failed("listfiles", kind, v, hint, used)
+			end
+		end
+	end
+
+	-- getcustomasset per file type (videos and images from the folder go through this)
+	local function assetCheck(label, path, bytes, optional)
+		local name = "getcustomasset (" .. label .. ")"
+		local wk = put(path, bytes)
+		if wk ~= "ok" then
+			add(name, "SKIP", "needs writefile to work first", optional)
+			return
+		end
+		local kind, v, h, u = call("getcustomasset", path)
+		if kind == "ok" and type(v) == "string" and v ~= "" then
+			add(name, "PASS", "turns a ." .. label .. " file into an asset id", optional)
+		elseif kind == "ok" then
+			add(name, "FAIL", "getcustomasset returned " .. (type(v) == "string" and "an empty string" or type(v)) .. " for a ." .. label .. " file (executor bug)", optional)
+		else
+			failed(name, kind, v, h, u, optional)
+		end
+	end
+	assetCheck("png", PNG, "\137PNG\r\n\26\n" .. string.rep("\0", 16), false)
+	assetCheck("webm", WEBM, "\26\69\223\163" .. string.rep("\0", 16), false)
+	assetCheck("mp4", MP4, "\0\0\0\24ftypmp42" .. string.rep("\0", 16), true)
+
+	-- clean up (optional function; leftovers are named _unc_test.*)
+	if #created > 0 then
+		local badKind, badRaw, badHint, badUsed
+		for _, path in ipairs(created) do
+			local kind, raw, hint, used = call("delfile", path)
+			if kind ~= "ok" and not badKind then
+				badKind, badRaw, badHint, badUsed = kind, raw, hint, used
+			end
+		end
+		if badKind then
+			if badKind == "missing" then
+				add("delfile", "MISSING", "no delfile (optional): test files named _unc_test.* were left in '" .. DIR .. "', delete them by hand", true)
+			else
+				failed("delfile", badKind, badRaw, badHint, badUsed, true)
+			end
+		else
+			local kind, there = call("isfile", created[1])
+			if kind == "ok" and there == true then
+				add("delfile", "FAIL", "delfile ran without error but the file is still there (executor bug)", true)
+			else
+				add("delfile", "PASS", "removed the test files", true)
+			end
+		end
+	end
+
+	-- what each NovaUI feature needs, in plain words
+	local features = {}
+	local function feature(title, needs, fallback)
+		local problems = {}
+		for _, name in ipairs(needs) do
+			local r = byName[name]
+			if r and (r.Status == "FAIL" or r.Status == "MISSING" or (r.Status == "SKIP" and string.sub(r.Note, 1, 5) == "needs")) then
+				table.insert(problems, name .. " (" .. string.lower(r.Status) .. ")")
+			end
+		end
+		local entry = { Name = title, Ok = #problems == 0, Problems = problems }
+		entry.Note = entry.Ok and "works" or ("limited by your executor: " .. table.concat(problems, ", ") .. ". " .. fallback)
+		table.insert(features, entry)
+		if options.Quiet ~= true then
+			out("[NovaUI UNC] feature  " .. title .. ": " .. entry.Note)
+		end
+	end
+	feature("Presets saved to disk", { "writefile", "readfile", "isfile" }, "Presets still work for this session only.")
+	feature("Backgrounds from the NovaUI/backgrounds folder", { "getcustomasset (webm)", "getcustomasset (png)", "isfile" }, "You can still use asset ids or Pixels backgrounds.")
+	feature("File picker for the folder", { "listfiles" }, "Type the file name in the Source box instead.")
+	feature("Images / videos from links", { "writefile", "getcustomasset (png)" }, "Use asset ids or the folder instead.")
+
+	local problemNames = {}
+	for _, r in ipairs(results) do
+		if r.Status == "FAIL" or (r.Status == "MISSING" and not r.Optional) then
+			table.insert(problemNames, r.Name .. " (" .. string.lower(r.Status) .. ")")
+		end
+	end
+	local summary = "UNC check: " .. counts.PASS .. " passed, " .. counts.FAIL .. " failed, " .. counts.MISSING .. " missing. "
+	if #problemNames > 0 then
+		summary = summary .. "Executor problems: " .. table.concat(problemNames, ", ") .. ". These come from your executor, not NovaUI."
+	else
+		summary = summary .. "Everything NovaUI needs works."
+	end
+	if options.Quiet ~= true then
+		out("[NovaUI UNC] " .. summary)
+	end
+	return { Results = results, Counts = counts, Features = features, Summary = summary, Healthy = #problemNames == 0 }
+end
+
+-- Problems NovaUI hit while calling executor functions this session (one entry per function and cause).
+function Library.GetExecutorIssues()
+	local copy = {}
+	for i, issue in ipairs(uncIssues) do
+		copy[i] = issue
+	end
+	return copy
 end
 
 -- Library.HashKey("hello123") -> "nv1$..." string for KeySystem.KeyHash, so the plain key never has to sit in a script.
