@@ -19,6 +19,10 @@ end)
 
 -- Everything below is also available from the gear button in the window.
 -- Window:SetBackground({ Image = { Game = 920587237 } })
--- Window:SetBackground({ Video = 1234567890, ColorMap = loadstring(readfile("map.lua"))(), Match = true })
+-- A file in workspace/NovaUI/backgrounds finds its colour map by itself:
+--   python3 tools/novaui_tool.py colormap intro.webm --sidecar   (writes intro.map.txt next to it)
+-- Window:SetBackground({ Video = "intro.webm", Match = true })
+-- For an asset id, pass the map yourself (no loadstring needed for the text format):
+-- Window:SetBackground({ Video = 1234567890, ColorMap = Library.ParseColorMap(readfile("NovaUI/backgrounds/intro.map.txt")), Match = true })
 -- Window:ClearBackground()
 -- Window:ToggleSettings()

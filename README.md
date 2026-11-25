@@ -114,10 +114,20 @@ Buttons, rows, bars and text take on the colour of the picture behind them (a re
 **Be aware:** Roblox cannot read pixels from a video or a web image while it plays, so matching needs the colours supplied up front:
 
 - `Pixels` pictures carry their own colours: matching just works.
-- For videos and images, make a *colour map* once: `python3 tools/novaui_tool.py colormap clip.mp4 --cols 12 --rows 8 --fps 2 --out map.lua` (needs ffmpeg), then
+- **Files in `workspace/NovaUI/backgrounds` (easiest):** make the map once with
+  `python3 tools/novaui_tool.py colormap intro.webm --sidecar` (needs ffmpeg). It writes `intro.map.txt` next to the video.
+  Put both files in the folder: NovaUI finds `intro.map.txt` by itself (the settings say "Colour map found") and **Match colours** can be switched on.
+  Presets remember it. Pictures work the same way (`wall.png` + `wall.map.txt`). The file is plain text and is never run as code.
+  `python3 tools/novaui_tool.py convert intro.mp4 --map` converts the video to `.webm` and writes the map in one go.
+- **Asset ids and links:** make a *colour map* once: `python3 tools/novaui_tool.py colormap clip.mp4 --cols 12 --rows 8 --fps 2 --out map.lua` (needs ffmpeg), then
   `Background = { Video = 123, ColorMap = loadstring(readfile("map.lua"))(), Match = true }`, or paste the table in directly.
+  Or read a text map yourself: `ColorMap = Library.ParseColorMap(readfile("NovaUI/backgrounds/intro.map.txt"))` (no loadstring needed; returns `nil, reason` if the file is wrong).
   The map is indexed by the video's playback time, so colours follow the footage.
-- Without a map the Match switch refuses and tells you so.
+- A `ColorMap` given in code always wins over a `.map.txt` file.
+- A map belongs to one video: switching to another file or id never reuses the previous map (a folder file finds its own `.map.txt`).
+- Without a map the Match switch refuses and tells you exactly what to run.
+
+Map file format (`NVMAP1`), in case you want to write one yourself: the first line is `NVMAP1 cols=12 rows=8 interval=0.5000`, then one line per frame with `cols * rows * 6` hex digits (`rrggbb` per cell, row by row). At most 64 x 64 cells, 4000 frames and 2 MB. Blank lines and lines starting with `#` are ignored; Windows line endings are fine.
 
 It is a beta: colours update 5 times a second, and a button you are hovering keeps its hover colour until you move off.
 
@@ -129,7 +139,7 @@ It is a beta: colours update 5 times a second, and a button you are hovering kee
 
 ## Tests
 
-`python3 test/test_tool.py` checks the converter tool (needs ffmpeg).
+`python3 test/test_tool.py` checks the tool: `pixels`, `colormap` (Lua and `--sidecar` text maps) and `convert` (needs ffmpeg).
 
 `pip install lupa && python3 test/run_tests.py` runs the suite on a strict mock of the Roblox API (Lua 5.2 + `bit32`). It has not been run inside real Roblox.
 

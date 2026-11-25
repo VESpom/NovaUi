@@ -3785,6 +3785,366 @@ test("unc: the settings button runs the check and shows the summary", function()
 end)
 
 ----------------------------------------------------------------------
+-- 9. Round 4: colour-map sidecar files (intro.webm + intro.map.txt) read without loadstring
+----------------------------------------------------------------------
+local VID = "\26\69\223\163xxxx"
+local SIDECAR = readFile(FIXDIR .. "two_frame_map.map.txt") -- real output of tools/novaui_tool.py (red, then blue)
+local GREEN_MAP = "NVMAP1 cols=1 rows=1 interval=1.0000\n00ff00\n"
+
+local function pageHas(win, part)
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if type(d._props.Text) == "string" and d._props.Text:find(part, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- a window with the given files in workspace/NovaUI/backgrounds (name -> data)
+local function folderBgWin(files, broken)
+	local ex = fullExec(broken)
+	for name, data in pairs(files) do
+		ex.fs["NovaUI/backgrounds/" .. name] = data
+	end
+	local Lib, win = bgWin()
+	return ex, win, Lib
+end
+
+local function pickFile(win, name)
+	local opt = optionByText(win._settings.page, name)
+	assert(opt, "not listed in the picker: " .. name)
+	opt.Activated:Fire()
+	M.advance(0.5)
+end
+
+test("sidecar: the tool's text map is read (no loadstring) and equals the Lua-format map", function()
+	local Lib = loadLib()
+	local saved, used = _G.loadstring, false
+	_G.loadstring = function() used = true end
+	local map, why = Lib.ParseColorMap(SIDECAR)
+	_G.loadstring = saved
+	check(map ~= nil, tostring(why))
+	check(not used, "loadstring was not used")
+	local lua = fixture("two_frame_map.lua")
+	eq(map.Cols, lua.Cols, "cols")
+	eq(map.Rows, lua.Rows, "rows")
+	eq(map.Interval, lua.Interval, "interval")
+	eq(#map.Frames, #lua.Frames, "frame count")
+	eq(map.Frames[1], lua.Frames[1], "frame 1")
+	eq(map.Frames[2], lua.Frames[2], "frame 2")
+end)
+
+test("sidecar: the parser never turns file text into code (source check)", function()
+	local a = srcText:find("-- Text colour maps", 1, true)
+	local b = a and srcText:find("-- Pixels = { W, H, Data", a, true)
+	check(a and b and b > a, "section found")
+	local section = srcText:sub(a, b):gsub("%-%-[^\n]*", "") -- comments may say the word; code may not use it
+	for _, bad in ipairs({ "loadstring", "load(", "require(", "getfenv", "setfenv", "HttpGet", "dofile" }) do
+		check(not section:find(bad, 1, true), "section does not contain " .. bad)
+	end
+end)
+
+test("sidecar: Windows line endings, a BOM, comments, blank lines, capitals, spaces and unknown keys are fine", function()
+	local Lib = loadLib()
+	local map, why = Lib.ParseColorMap("\239\187\191# made by hand\r\n\r\nNVMAP1 cols=1 rows=1 future=7\r\nFF0000\r\n  00ff00  \r\n\r\n")
+	check(map ~= nil, tostring(why))
+	eq(#map.Frames, 2, "two frames")
+	eq(map.Frames[1], "FF0000", "capitals kept")
+	eq(map.Frames[2], "00ff00", "spaces trimmed")
+	eq(map.Interval, nil, "interval is optional")
+	local map2 = Lib.ParseColorMap("NVMAP1 cols=1 rows=1 interval=2.5\nffffff")
+	eq(map2.Interval, 2.5, "interval read")
+	eq(#Lib.ParseColorMap("NVMAP1 cols=1 rows=1\n" .. string.rep("ffffff\n", 4000)).Frames, 4000, "4000 frames are the limit and accepted")
+end)
+
+test("sidecar: broken text maps are refused with the reason in plain words", function()
+	local Lib = loadLib()
+	local cases = {
+		{ "", "empty" }, { "  \n\n", "empty" }, { "# only a comment", "empty" },
+		{ "hello", "NVMAP1" }, { "NVMAP12 cols=1 rows=1\nffffff", "NVMAP1" },
+		{ "NVMAP1", "cols= and rows=" }, { "NVMAP1 cols=2\nffffff", "cols= and rows=" },
+		{ "NVMAP1 cols=0 rows=1\nffffff", "1 to 64" }, { "NVMAP1 cols=65 rows=1\nffffff", "1 to 64" },
+		{ "NVMAP1 cols=1.5 rows=1\nffffff", "1 to 64" }, { "NVMAP1 cols=0x2 rows=1\nffffff", "cols= and rows=" },
+		{ "NVMAP1 cols=1 rows=1 interval=0\nffffff", "interval" }, { "NVMAP1 cols=1 rows=1 interval=abc\nffffff", "interval" },
+		{ "NVMAP1 cols=1 rows=1\nfff", "frame 1 has 3 characters, expected 6" },
+		{ "NVMAP1 cols=2 rows=1\nffffffffffff\nffffff", "frame 2 has 6 characters, expected 12" },
+		{ "NVMAP1 cols=1 rows=1\nffffff\nzzzzzz", "frame 2 has characters that are not hex digits" },
+		{ "NVMAP1 cols=1 rows=1\n", "no frames" },
+		{ "NVMAP1 cols=1 rows=1\n" .. string.rep("ffffff\n", 4001), "more than 4000 frames" },
+		{ "NVMAP1 cols=64 rows=64\n" .. string.rep("f", 2000001), "2 MB" },
+	}
+	for _, c in ipairs(cases) do
+		local map, why = Lib.ParseColorMap(c[1])
+		check(map == nil, "refused: " .. c[2])
+		has(why, c[2], "reason for " .. c[2])
+	end
+	for _, notText in ipairs({ 5, true, {}, false }) do
+		local map, why = Lib.ParseColorMap(notText)
+		check(map == nil and why ~= nil, "non-text refused: " .. tostring(notText))
+	end
+	local map = Lib.ParseColorMap(nil)
+	eq(map, nil, "nil refused")
+end)
+
+test("sidecar: intro.map.txt next to intro.webm is its colour map, and Match colours follows the video", function()
+	local _, win = folderBgWin({ ["intro.webm"] = VID, ["intro.map.txt"] = SIDECAR })
+	check(win:SetBackground({ Video = "intro.webm" }), "accepted")
+	M.advance(0.5)
+	local bg = win:GetBackground()
+	eq(bg.Status, "ready", "video ready")
+	eq(bg.HasColorMap, true, "map found")
+	eq(bg.MapFile, "intro.map.txt", "map file named")
+	check(win:SetBackgroundMatch(true), "match accepted")
+	local main = win._main
+	main.AbsolutePosition, main.AbsoluteSize = M.Vector2.new(0, 0), M.Vector2.new(580, 380)
+	local c = cards(win)[1]
+	c.AbsoluteSize, c.AbsolutePosition = M.Vector2.new(100, 30), M.Vector2.new(100, 100)
+	local v = findByName(win._main, "BgVideo")
+	v.TimePosition = 0.2
+	M.services.RunService.Heartbeat:Fire(0.3); M.advance(0.5)
+	local a = c.BackgroundColor3
+	v.TimePosition = 1.2
+	M.services.RunService.Heartbeat:Fire(0.3); M.advance(0.5)
+	local b = c.BackgroundColor3
+	check(a.R > a.B and b.B > b.R, "first second red, second blue")
+	wipeExec()
+end)
+
+test("sidecar: SetBackground({ Video = 'intro.webm', Match = true }) (the README example) turns matching on by itself", function()
+	local _, win, Lib = folderBgWin({ ["intro.webm"] = VID, ["intro.map.txt"] = SIDECAR })
+	win:SetBackground({ Video = "intro.webm", Match = true })
+	M.advance(0.5)
+	eq(win:GetBackground().Match, true, "match on")
+	eq(win:GetBackground().HasColorMap, true, "from the sidecar")
+	-- and Library.ParseColorMap(readfile(...)) is the other documented route for ids
+	local map = Lib.ParseColorMap(readFile(FIXDIR .. "two_frame_map.map.txt"))
+	win:SetBackground({ Video = 777, ColorMap = map, Match = true })
+	eq(win:GetBackground().Match, true, "ParseColorMap result accepted as ColorMap")
+	eq(win:GetBackground().MapFile, nil, "not a file")
+	wipeExec()
+end)
+
+test("sidecar: works for pictures too, and for names with dots, spaces and brackets", function()
+	local _, win = folderBgWin({ ["wall.png"] = PNG, ["wall.map.txt"] = GREEN_MAP, ["my clip (1).v2.webm"] = VID, ["my clip (1).v2.map.txt"] = SIDECAR })
+	win:SetBackground({ Image = "wall.png" })
+	M.advance(0.5)
+	eq(win:GetBackground().Type, "image", "image")
+	eq(win:GetBackground().MapFile, "wall.map.txt", "picture map")
+	win:SetBackground({ Video = "my clip (1).v2.webm" })
+	M.advance(0.5)
+	eq(win:GetBackground().MapFile, "my clip (1).v2.map.txt", "name with dots, spaces and brackets")
+	wipeExec()
+end)
+
+test("folder: typing a missing file name shows the real error, not a stuck 'Loading...' note", function()
+	local _, win = folderBgWin({})
+	win:SetSettingsOpen(true)
+	local box
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if d._class == "TextBox" and d.PlaceholderText == "file name, asset id or https link, press Enter" then box = d end
+	end
+	box.Text = "nothing.webm"
+	box.FocusLost:Fire(true)
+	M.advance(0.5)
+	check(pageHas(win, "file not found"), "the error is shown")
+	check(not pageHas(win, "Loading nothing.webm"), "not overwritten by Loading")
+	wipeExec()
+end)
+
+test("sidecar: no sidecar means no map, no warning; the toggle says exactly what to run", function()
+	local _, win = folderBgWin({ ["intro.webm"] = VID })
+	local before = #M.warnings
+	win:SetSettingsOpen(true)
+	win:SetBackground({ Video = "intro.webm" })
+	M.advance(0.5)
+	eq(win:GetBackground().HasColorMap, false, "no map")
+	eq(win:GetBackground().MapFile, nil, "no map file")
+	eq(#M.warnings, before, "a missing optional file is not worth a warning")
+	win._settings.bgMatch:Set(true)
+	eq(win:GetBackground().Match, false, "switch snaps back")
+	check(pageHas(win, "colormap intro.webm --sidecar"), "tells the command")
+	check(pageHas(win, "intro.map.txt"), "tells the file name")
+	wipeExec()
+end)
+
+test("sidecar: a ColorMap given in the call wins over the file, and is not reported as a file", function()
+	local _, win = folderBgWin({ ["intro.webm"] = VID, ["intro.map.txt"] = SIDECAR })
+	local own = { Cols = 1, Rows = 1, Interval = 1, Frames = { "00ff00" } }
+	win:SetBackground({ Video = "intro.webm", ColorMap = own })
+	M.advance(0.5)
+	check(win._bg.map == own, "the table from the call")
+	eq(win:GetBackground().MapFile, nil, "no map file")
+	wipeExec()
+end)
+
+test("sidecar: a broken file never breaks the background; it is explained (console and settings)", function()
+	for _, case in ipairs({ { "garbage", "NVMAP1" }, { "NVMAP1 cols=1 rows=1\nfff", "frame 1 has 3 characters" }, { "NVMAP1 cols=1 rows=1\n", "no frames" } }) do
+		local _, win = folderBgWin({ ["intro.webm"] = VID, ["intro.map.txt"] = case[1] })
+		win:SetSettingsOpen(true)
+		check(win:SetBackground({ Video = "intro.webm" }), "accepted")
+		M.advance(0.5)
+		eq(win:GetBackground().Status, "ready", "video still ready")
+		eq(win:GetBackground().HasColorMap, false, "no map")
+		check(warned("intro.map.txt is not usable: "), "console says it is not usable")
+		check(warned(case[2]), "console gives the reason: " .. case[2])
+		check(pageHas(win, "Background ready, but intro.map.txt is not usable"), "settings note")
+		win._settings.bgMatch:Set(true)
+		eq(win:GetBackground().Match, false, "no matching without a usable map")
+		check(pageHas(win, "Colour matching is off: intro.map.txt is not usable"), "toggle explains the real reason")
+	end
+	wipeExec()
+end)
+
+test("sidecar: an executor whose readfile fails is blamed, not the map; a missing isfile just means no map", function()
+	local _, win = folderBgWin({ ["intro.webm"] = VID, ["intro.map.txt"] = SIDECAR }, { readfile = "access denied" })
+	win:SetBackground({ Video = "intro.webm" })
+	M.advance(0.5)
+	eq(win:GetBackground().Status, "ready", "video ready anyway")
+	eq(win:GetBackground().HasColorMap, false, "no map")
+	check(warned("UNC / executor problem"), "blames the executor")
+	check(warned("readfile"), "names readfile")
+	check(warned("could not read intro.map.txt"), "says which file")
+	wipeExec()
+
+	local _, win2 = folderBgWin({ ["intro.webm"] = VID, ["intro.map.txt"] = SIDECAR }, { isfile = "missing" })
+	local before = #M.warnings -- counted after the window exists (creating one resets the mock)
+	win2:SetBackground({ Video = "intro.webm" })
+	M.advance(0.5)
+	eq(win2:GetBackground().Status, "ready", "ready without isfile")
+	eq(win2:GetBackground().HasColorMap, false, "no map without isfile")
+	eq(#M.warnings, before, "nothing to warn about")
+	wipeExec()
+end)
+
+test("sidecar: path tricks never reach readfile", function()
+	local ex = fullExec()
+	ex.fs["secret.map.txt"] = SIDECAR
+	ex.fs["secret.webm"] = VID
+	local seen = {}
+	local realRead = _G.readfile
+	_G.readfile = function(path) table.insert(seen, path) return realRead(path) end
+	local _, win = bgWin()
+	for _, bad in ipairs({ "../secret.webm", "NovaUI/backgrounds/../../secret.webm", "a/b.webm", "x..y.webm" }) do
+		win:SetBackground({ Video = bad })
+		M.advance(0.3)
+	end
+	for _, p in ipairs(seen) do
+		check(not p:find("..", 1, true) and p:sub(1, 19) == "NovaUI/backgrounds/", "only folder paths read: " .. p)
+	end
+	wipeExec()
+end)
+
+test("sidecar: the file picker hides the map files and shows that a map was found", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/intro.webm"] = VID
+	ex.fs["NovaUI/backgrounds/intro.map.txt"] = SIDECAR
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local page = win._settings.page
+	check(optionByText(page, "intro.webm") ~= nil, "video listed")
+	check(optionByText(page, "intro.map.txt") == nil, "map file not listed as a background")
+	pickFile(win, "intro.webm")
+	check(pageHas(win, "Colour map found (intro.map.txt)"), "settings say it was found")
+	win._settings.bgMatch:Set(true)
+	eq(win:GetBackground().Match, true, "Match colours can be switched on")
+	wipeExec()
+end)
+
+test("sidecar: each file uses its own map; a map is never inherited by another file (Match follows what exists)", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/a.webm"] = VID
+	ex.fs["NovaUI/backgrounds/a.map.txt"] = SIDECAR
+	ex.fs["NovaUI/backgrounds/b.webm"] = VID
+	ex.fs["NovaUI/backgrounds/b.map.txt"] = GREEN_MAP
+	ex.fs["NovaUI/backgrounds/c.webm"] = VID
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	pickFile(win, "a.webm")
+	eq(#win._bg.map.Frames, 2, "a: its own two-frame map")
+	check(win:SetBackgroundMatch(true), "match on")
+	pickFile(win, "b.webm")
+	eq(win:GetBackground().MapFile, "b.map.txt", "b: its own file")
+	eq(win._bg.map.Cols, 1, "b: not a's map")
+	eq(win:GetBackground().Match, true, "match stays on when the new file has a map too")
+	pickFile(win, "c.webm")
+	eq(win:GetBackground().HasColorMap, false, "c: no sidecar, so no inherited map")
+	eq(win:GetBackground().Match, false, "match is off without a map")
+	pickFile(win, "a.webm")
+	eq(#win._bg.map.Frames, 2, "back to a: read from its file again")
+	wipeExec()
+end)
+
+test("sidecar: picking the same file again keeps a ColorMap that was given in code", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/a.webm"] = VID
+	ex.fs["NovaUI/backgrounds/b.webm"] = VID
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	local own = { Cols = 1, Rows = 1, Interval = 1, Frames = { "00ff00" } }
+	win:SetBackground({ Video = "a.webm", ColorMap = own })
+	M.advance(0.5)
+	pickFile(win, "a.webm")
+	check(win._bg.map == own, "same file: map kept")
+	pickFile(win, "b.webm")
+	check(win._bg.map == nil, "other file: map dropped")
+	wipeExec()
+end)
+
+test("sidecar: a preset brings the folder video back WITH its map and Match on (even after the background was removed)", function()
+	local ex = fullExec()
+	ex.fs["NovaUI/backgrounds/a.webm"] = VID
+	ex.fs["NovaUI/backgrounds/a.map.txt"] = SIDECAR
+	local _, win = setWin()
+	win:SetSettingsOpen(true)
+	pickFile(win, "a.webm")
+	check(win:SetBackgroundMatch(true), "match on")
+	win._settings.nameInput:Set("Mapped")
+	clickRow(win, "Save preset")
+	win:ClearBackground()
+	eq(win:GetBackground(), nil, "removed")
+	loadPreset(win, "Mapped")
+	M.advance(0.5)
+	local bg = win:GetBackground()
+	check(bg ~= nil, "background is back")
+	eq(bg.HasColorMap, true, "map read again from the file")
+	eq(bg.MapFile, "a.map.txt", "the file")
+	eq(bg.Match, true, "Match colours is on again")
+
+	-- the map file was deleted meanwhile: the preset still loads the video, Match simply stays off
+	win:ClearBackground()
+	ex.fs["NovaUI/backgrounds/a.map.txt"] = nil
+	loadPreset(win, "Mapped")
+	M.advance(0.5)
+	eq(win:GetBackground().Status, "ready", "video loads")
+	eq(win:GetBackground().HasColorMap, false, "no map")
+	eq(win:GetBackground().Match, false, "match off, no error")
+	wipeExec()
+end)
+
+test("background: typing the same id keeps its colour map, a different id does not inherit it; Match needs a map", function()
+	local _, win = bgWin()
+	local map = { Cols = 2, Rows = 1, Interval = 1, Frames = { hex6(255, 0, 0) .. hex6(0, 255, 0) } }
+	win:SetBackground({ Video = 555, ColorMap = map, Match = true })
+	win:SetSettingsOpen(true)
+	local box
+	for _, d in ipairs(win._settings.page:GetDescendants()) do
+		if d._class == "TextBox" and d.PlaceholderText == "file name, asset id or https link, press Enter" then box = d end
+	end
+	box.Text = "555"
+	box.FocusLost:Fire(true)
+	M.advance(0.3)
+	check(win._bg.map == map, "same id: map kept")
+	eq(win:GetBackground().Match, true, "match kept")
+	box.Text = "556"
+	box.FocusLost:Fire(true)
+	M.advance(0.3)
+	eq(win:GetBackground().HasColorMap, false, "other id: no inherited map")
+	eq(win:GetBackground().Match, false, "match cannot stay on without a map")
+	win:SetBackground({ Video = 5, Match = true })
+	eq(win:GetBackground().Match, false, "SetBackground(Match = true) without any map does not claim to be on")
+end)
+
+----------------------------------------------------------------------
 print(string.format("RESULT passed=%d failed=%d", passed, failed))
 for _, f in ipairs(failures) do
 	print("FAIL " .. f)

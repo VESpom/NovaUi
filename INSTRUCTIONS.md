@@ -63,13 +63,19 @@ You can also type the file name (`intro.webm`) into **Source** and press Enter. 
 Source for the video rule: a Roblox developer-forum answer from 2022 ([thread](https://devforum.roblox.com/t/what-type-of-filescodecs-do-videoframes-support/1659542)). It may have changed, so trust the 10-second hint below if they disagree.
 
 ### Turn any video into a working `.webm`
-Install ffmpeg, then:
+You need [ffmpeg](https://ffmpeg.org) and Python on your computer, and the file `tools/novaui_tool.py` from this repo. Then:
 
 ```
-ffmpeg -i input.mp4 -c:v libvpx -b:v 1M -vf scale=-2:540 -an output.webm
+python3 tools/novaui_tool.py convert input.mp4
 ```
 
-(That exact command was run and gives a VP8 file at 960x540.)
+It writes `input.webm` next to the original: VP8, no sound, at most 540 pixels tall (never enlarged). Copy it into `workspace/NovaUI/backgrounds`.
+
+- Too big or slow to load? Add `--bitrate 600k`, `--height 360` or `--fps 24`.
+- It never overwrites a file by accident; add `--force` to replace one.
+- If the file name has odd characters (like `!` or `;`) it is cleaned for you, because NovaUI only lists names with letters, digits, space and `- . _ ( )`.
+
+(Without the tool, the same result by hand: `ffmpeg -i input.mp4 -c:v libvpx -b:v 1M -vf scale=-2:540 -an output.webm`.)
 
 ### If the window stays plain
 - After 10 seconds without the video loading, NovaUI tells you in the settings and the console to convert it to `.webm`.
@@ -81,7 +87,24 @@ ffmpeg -i input.mp4 -c:v libvpx -b:v 1M -vf scale=-2:540 -an output.webm
 An asset id, an `https://` link (downloaded once into `workspace/NovaUI/`) or a small embedded picture (`Pixels`). See `README.md`.
 
 ### Match colours [beta]
-This makes buttons and text follow the colours behind them. Roblox cannot read the pixels of a playing video, so it needs a pre-made colour map (see `README.md`, tool `tools/novaui_tool.py`). Files dropped in the folder are **not** matched automatically yet.
+This makes buttons and text follow the colours behind them. Roblox cannot read the pixels of a playing video, so NovaUI needs a small **colour map file** made once on your computer. With a file in the folder it is simple:
+
+1. Make the map next to your video:
+   ```
+   python3 tools/novaui_tool.py colormap intro.webm --sidecar
+   ```
+   This creates `intro.map.txt`. (Or do both steps at once: `python3 tools/novaui_tool.py convert intro.mp4 --map`.)
+2. Put `intro.webm` **and** `intro.map.txt` in `workspace/NovaUI/backgrounds`. The map must have the same name as the video.
+3. Pick the video in ⚙ → **Background**. The note says **Colour map found (intro.map.txt)**.
+4. Switch on **Match colours [beta]**.
+
+What to know:
+- The `.map.txt` file does not show up in the file picker. That is normal; it is read together with the video.
+- Pictures work the same way: `wall.png` + `wall.map.txt`.
+- No map file? The switch stays off and the note tells you the exact command to run.
+- A broken map file (edited by hand, cut off) is explained in the note and the console, and the background still shows.
+- Presets remember it: loading a preset brings back the video, its map and the switch.
+- A long video: the map covers 60 seconds by default. For a longer one add `--max-seconds 0` (the whole video). The tool warns you when the map is shorter than the video.
 
 ---
 

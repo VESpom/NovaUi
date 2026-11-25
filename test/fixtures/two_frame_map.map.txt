@@ -1,0 +1,3 @@
+NVMAP1 cols=2 rows=1 interval=1.0000
+fc0000fc0000
+0000fd0000fd

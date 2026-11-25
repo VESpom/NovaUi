@@ -4670,6 +4670,120 @@ local function validMap(map)
 	return true
 end
 
+-- Text colour maps ("sidecar" files). A plain-text file next to a folder video holds its colour map, so
+-- Match colours works for folder files without any loadstring. Made by tools/novaui_tool.py:
+--   NVMAP1 cols=12 rows=8 interval=0.5000
+--   <one line of cols*rows*6 hex digits per frame, row by row>
+-- Lines starting with # are comments. Returns the map, or nil + a reason in plain words.
+local MAX_MAP_TEXT = 2000000
+
+local function mapNumber(value)
+	if string.match(value, "^%d+%.?%d*$") then
+		return tonumber(value)
+	end
+	return nil
+end
+
+local function parseColorMap(text)
+	if type(text) ~= "string" or text == "" then
+		return nil, "the file is empty"
+	end
+	if #text > MAX_MAP_TEXT then
+		return nil, "the file is over 2 MB: make the map again with a lower --fps, fewer --cols/--rows or a shorter --max-seconds"
+	end
+	if string.sub(text, 1, 3) == "\239\187\191" then
+		text = string.sub(text, 4) -- the invisible UTF-8 marker some editors add
+	end
+	local cols, rows, interval
+	local frames = {}
+	local seenHeader = false
+	for line in string.gmatch(text, "[^\r\n]+") do
+		line = trimText(line)
+		if line ~= "" and string.sub(line, 1, 1) ~= "#" then
+			if not seenHeader then
+				seenHeader = true
+				local rest = line == "NVMAP1" and "" or string.match(line, "^NVMAP1%s+(.*)$")
+				if not rest then
+					return nil, "the first line must start with NVMAP1 (make the file with tools/novaui_tool.py)"
+				end
+				for key, value in string.gmatch(rest, "(%a+)=(%S+)") do
+					if key == "cols" then
+						cols = mapNumber(value)
+					elseif key == "rows" then
+						rows = mapNumber(value)
+					elseif key == "interval" then
+						interval = mapNumber(value)
+						if not interval or interval <= 0 then
+							return nil, "interval= must be a number above 0"
+						end
+					end
+				end
+				if not cols or not rows or cols ~= math.floor(cols) or rows ~= math.floor(rows) or cols < 1 or rows < 1 or cols > MAX_PIXELS or rows > MAX_PIXELS then
+					return nil, "the header needs cols= and rows= (whole numbers from 1 to " .. MAX_PIXELS .. ")"
+				end
+			else
+				local n = #frames + 1
+				if n > 4000 then
+					return nil, "more than 4000 frames: make the map again with a lower --fps or a shorter --max-seconds"
+				end
+				if #line ~= cols * rows * 6 then
+					return nil, "frame " .. n .. " has " .. #line .. " characters, expected " .. (cols * rows * 6) .. " (cols x rows x 6)"
+				end
+				if string.find(line, "%X") then
+					return nil, "frame " .. n .. " has characters that are not hex digits"
+				end
+				frames[n] = line
+			end
+		end
+	end
+	if not seenHeader then
+		return nil, "the file is empty"
+	end
+	if #frames < 1 then
+		return nil, "the file has a header but no frames"
+	end
+	local map = { Cols = cols, Rows = rows, Interval = interval, Frames = frames }
+	if not validMap(map) then
+		return nil, "the map is not valid"
+	end
+	return map
+end
+
+-- Library.ParseColorMap(readfile("NovaUI/backgrounds/intro.map.txt")) -> map | nil, reason
+Library.ParseColorMap = parseColorMap
+
+-- "NovaUI/backgrounds/intro.webm" -> "NovaUI/backgrounds/intro.map.txt"
+local function sidecarPathFor(fullPath)
+	local stem = string.match(fullPath, "^(.*)%.%w+$")
+	if not stem then
+		return nil
+	end
+	return stem .. ".map.txt", (string.match(stem, "([^/]+)$") or stem) .. ".map.txt"
+end
+
+-- map, fileName  when a valid sidecar sits next to the file.
+-- nil, nil       when there is none (normal: the map is optional, nothing is said).
+-- nil, nil, why  when there is one that cannot be used (executor failed to read it, or it is malformed).
+local function loadSidecar(fullPath)
+	local mapPath, mapName = sidecarPathFor(fullPath)
+	if not mapPath then
+		return nil
+	end
+	local okFile, exists = uncRun("background folder", "isfile", true, mapPath)
+	if not okFile or exists ~= true then
+		return nil
+	end
+	local okRead, text, whyRead = uncRun("background folder", "readfile", false, mapPath)
+	if not okRead then
+		return nil, nil, "could not read " .. mapName .. ": " .. tostring(whyRead)
+	end
+	local map, reason = parseColorMap(text)
+	if not map then
+		return nil, nil, mapName .. " is not usable: " .. tostring(reason)
+	end
+	return map, mapName
+end
+
 -- Pixels = { W, H, Data = "rrggbb..." } (row-major). Doubles as a one-frame colour map.
 function validPixels(px)
 	if type(px) ~= "table" or type(px.W) ~= "number" or type(px.H) ~= "number" or type(px.Data) ~= "string" then
@@ -5020,10 +5134,18 @@ function Library:SetBackground(spec)
 		warn("[NovaUI] SetBackground: give Video, Image or Pixels")
 		return false
 	end
+	local sidecarMap, mapFile, mapProblem
 	if kind ~= "pixels" then
 		local fullPath = localBgFile(source)
 		if fullPath then
 			source = fullPath -- "intro.webm" is remembered (and saved in presets) as NovaUI/backgrounds/intro.webm
+			if spec.ColorMap == nil then
+				-- intro.map.txt next to intro.webm is its colour map (a ColorMap given in the call wins)
+				sidecarMap, mapFile, mapProblem = loadSidecar(fullPath)
+				if mapProblem then
+					warn("[NovaUI] background: " .. mapProblem)
+				end
+			end
 		end
 	end
 	local map = nil
@@ -5033,6 +5155,8 @@ function Library:SetBackground(spec)
 		else
 			warn("[NovaUI] SetBackground: ColorMap is not valid, colour matching stays off")
 		end
+	elseif sidecarMap then
+		map = sidecarMap
 	elseif kind == "pixels" then
 		map = { Cols = source.W, Rows = source.H, Interval = 1, Frames = { source.Data } }
 	end
@@ -5048,8 +5172,10 @@ function Library:SetBackground(spec)
 		dim = dim,
 		glass = glass,
 		glassUsed = glass,
-		match = spec.Match == true,
+		match = spec.Match == true and map ~= nil, -- "on" without a map would only look on
 		map = map,
+		mapFile = sidecarMap and mapFile or nil,
+		mapProblem = mapProblem,
 		status = "loading",
 	}
 	self._bg = state
@@ -5186,7 +5312,7 @@ function Library:GetBackground()
 	if not bg then
 		return nil
 	end
-	return { Type = bg.kind, Source = bg.source, Dim = bg.dim, Glass = bg.glass, Match = bg.match, HasColorMap = bg.map ~= nil, Status = bg.status }
+	return { Type = bg.kind, Source = bg.source, Dim = bg.dim, Glass = bg.glass, Match = bg.match, HasColorMap = bg.map ~= nil, MapFile = bg.mapFile, Status = bg.status }
 end
 
 -- Dim / Glass / Match can be changed live without reloading the media.
@@ -5229,7 +5355,8 @@ function Library:_bgDecode(code)
 	if not kind or (kind ~= "video" and kind ~= "image") then
 		return false
 	end
-	local spec = { Dim = tonumber(dim), Glass = tonumber(glass), Match = match == "1" and self._bg ~= nil and self._bg.map ~= nil }
+	-- Match is asked for here; SetBackground keeps it only when the new background has a map (sidecar or kept)
+	local spec = { Dim = tonumber(dim), Glass = tonumber(glass), Match = match == "1" }
 	local source = urlDecode(src)
 	if string.match(source, "^%d+$") then
 		source = tonumber(source)
@@ -5239,10 +5366,20 @@ function Library:_bgDecode(code)
 	else
 		spec.Image = source
 	end
-	if self._bg and self._bg.map then
-		spec.ColorMap = self._bg.map
-	end
+	self:_bgKeepMap(spec, source)
 	return self:SetBackground(spec)
+end
+
+-- A colour map belongs to one video. When the same background is set again (a preset, the Source box) the
+-- map in use is kept; a different one never inherits it (a folder file finds its own intro.map.txt instead).
+function Library:_bgKeepMap(spec, source)
+	local bg = self._bg
+	if bg and bg.map and spec.ColorMap == nil then
+		local path = localBgFile(source)
+		if bg.source == (path or source) then
+			spec.ColorMap = bg.map
+		end
+	end
 end
 
 function Library:_onRecolor()
@@ -5309,10 +5446,12 @@ function Library:_buildBackgroundSettings(host, S)
 			S.bgNote:Set("That is not a usable file name (letters, digits, space - . _ ( ) and .webm .mp4 .png .jpg).")
 			return
 		end
-		local spec = { Dim = win._bg and win._bg.dim, Glass = win._bg and win._bg.glass }
+		local spec = { Dim = win._bg and win._bg.dim, Glass = win._bg and win._bg.glass, Match = win._bg and win._bg.match }
 		spec[fileKind == "video" and "Video" or "Image"] = path
-		win:SetBackground(spec)
+		win:_bgKeepMap(spec, path)
+		-- say "Loading" first: a folder file resolves at once, and its "ready" / error note must not be overwritten
 		S.bgNote:Set("Loading " .. name .. "...")
+		win:SetBackground(spec)
 	end
 	S.bgFiles = host:Dropdown("Files in folder", {}, function(name)
 		useFile(name)
@@ -5344,14 +5483,12 @@ function Library:_buildBackgroundSettings(host, S)
 		if localBgFile(text) then
 			return useFile(string.match(text, "([^/]+)$"))
 		end
-		local spec = { Dim = win._bg and win._bg.dim, Glass = win._bg and win._bg.glass }
+		local spec = { Dim = win._bg and win._bg.dim, Glass = win._bg and win._bg.glass, Match = win._bg and win._bg.match }
 		local source = string.match(text, "^%d+$") and tonumber(text) or text
 		spec[kindNow] = source
-		if win._bg and win._bg.map then
-			spec.ColorMap = win._bg.map
-		end
-		win:SetBackground(spec)
+		win:_bgKeepMap(spec, source)
 		S.bgNote:Set("Loading " .. string.lower(kindNow) .. "...")
+		win:SetBackground(spec)
 	end)
 	S.bgDim = host:Slider("Dim (readability)", math.floor(BG_MIN_DIM * 100), math.floor(BG_MAX_DIM * 100), math.floor(BG_DEFAULT_DIM * 100), function(v)
 		if not S.syncing then
@@ -5371,7 +5508,16 @@ function Library:_buildBackgroundSettings(host, S)
 			S.syncing = true
 			S.bgMatch:Set(false, true)
 			S.syncing = false
-			S.bgNote:Set(win._bg and "Colour matching needs a colour map for this video/image: make one with tools/novaui_tool.py (see README), or use a Pixels picture." or "Set a background first.")
+			local bg = win._bg
+			local path = bg and bg.source and localBgFile(bg.source)
+			local mapName = path and select(2, sidecarPathFor(path))
+			if bg and bg.mapProblem then
+				S.bgNote:Set("Colour matching is off: " .. bg.mapProblem)
+			elseif mapName then
+				S.bgNote:Set("No colour map next to this file. Run  python3 tools/novaui_tool.py colormap " .. string.match(path, "([^/]+)$") .. " --sidecar  and put " .. mapName .. " in the same folder, then pick the file again.")
+			else
+				S.bgNote:Set(bg and "Colour matching needs a colour map for this video/image: make one with tools/novaui_tool.py (see README), or use a Pixels picture." or "Set a background first.")
+			end
 		else
 			S.bgNote:Set(on and "Buttons and text now follow the colours behind them (beta)." or "Colour matching off.")
 		end
@@ -5384,7 +5530,14 @@ function Library:_buildBackgroundSettings(host, S)
 		if string.sub(status, 1, 6) == "failed" then
 			S.bgNote:Set("Could not load it (" .. string.sub(status, 9) .. ")")
 		elseif status == "ready" then
-			S.bgNote:Set("Background ready.")
+			local bg = win._bg
+			if bg and bg.mapFile then
+				S.bgNote:Set("Background ready. Colour map found (" .. bg.mapFile .. "): Match colours [beta] can be switched on.")
+			elseif bg and bg.mapProblem then
+				S.bgNote:Set("Background ready, but " .. bg.mapProblem)
+			else
+				S.bgNote:Set("Background ready.")
+			end
 		elseif status == "slow" then
 			S.bgNote:Set(win._bg and win._bg.note or "Roblox is still loading the video.")
 		end
