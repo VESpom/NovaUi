@@ -348,7 +348,6 @@ local PROP_TYPES = {
 	Image = "string", ImageTransparency = "number", Text = "string", PlaceholderText = "string", Name = "string",
 	TextSize = "number", Scale = "number", Thickness = "number", ScrollBarThickness = "number",
 	DisplayOrder = "number", Rotation = "number",
-	ImageRectOffset = "Vector2", ImageRectSize = "Vector2",
 	AbsolutePosition = "Vector2", AbsoluteSize = "Vector2", ViewportSize = "Vector2",
 	CornerRadius = "UDim", Padding = "UDim",
 	PaddingLeft = "UDim", PaddingTop = "UDim", PaddingRight = "UDim", PaddingBottom = "UDim",
@@ -427,7 +426,7 @@ local CLASSES = {
 		end,
 	},
 	ImageLabel = {
-		props = set(join(GUI_PROPS, { "Image", "ImageTransparency", "ImageColor3", "ScaleType", "ImageRectOffset", "ImageRectSize" })), signals = set(GUI_SIGNALS),
+		props = set(join(GUI_PROPS, { "Image", "ImageTransparency", "ImageColor3", "ScaleType" })), signals = set(GUI_SIGNALS),
 		defaults = function()
 			local d = guiDefaults()
 			d.Image = ""

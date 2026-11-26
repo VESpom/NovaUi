@@ -1455,8 +1455,6 @@ end
 -- sub-folders, no "..", only letters, digits, space and - . _ ( ). Anything else is not treated as a file.
 local BG_FOLDER = "NovaUI/backgrounds"
 local BG_FILE_KINDS = { webm = "video", mp4 = "video", png = "image", jpg = "image", jpeg = "image" }
--- "intro.anim.txt" is a picture animation (sprite sheets made by tools/novaui_tool.py anim): the answer for executors
--- where Roblox refuses local video files. Its sheets (intro.anim1.jpg ...) sit next to it.
 
 local function localBgFile(src)
 	if type(src) ~= "string" or #src > 120 then
@@ -1467,9 +1465,6 @@ local function localBgFile(src)
 		return nil
 	end
 	local kind = BG_FILE_KINDS[string.lower(string.match(name, "%.(%w+)$") or "")]
-	if string.match(string.lower(name), "%.anim%.txt$") and #name > 9 then
-		kind = "anim"
-	end
 	if not kind then
 		return nil
 	end
@@ -4295,7 +4290,7 @@ Library.ParseColorMap = parseColorMap
 
 -- "NovaUI/backgrounds/intro.webm" -> "NovaUI/backgrounds/intro.map.txt"
 local function sidecarPathFor(fullPath)
-	local stem = string.match(fullPath, "^(.*)%.[aA][nN][iI][mM]%.[tT][xX][tT]$") or string.match(fullPath, "^(.*)%.%w+$")
+	local stem = string.match(fullPath, "^(.*)%.%w+$")
 	if not stem then
 		return nil
 	end
@@ -4323,106 +4318,6 @@ local function loadSidecar(fullPath)
 		return nil, nil, mapName .. " is not usable: " .. tostring(reason)
 	end
 	return map, mapName
-end
-
--- Picture animations: "NVANIM1 cols=4 rows=5 fw=256 fh=192 fps=8 frames=68" in intro.anim.txt, and the frames laid out
--- row by row on intro.anim1.jpg, intro.anim2.jpg ... (cols*rows frames per sheet, the last sheet may be partly empty).
-local AnimBG = {}
-
-function AnimBG.parse(text)
-	text = string.gsub(tostring(text), "^\239\187\191", "")
-	local line = string.match(text, "^[^\r\n]*") or ""
-	local rest = string.match(line, "^NVANIM1%s+(.-)%s*$")
-	if not rest then
-		return nil, "it does not start with NVANIM1 (make it with: python3 tools/novaui_tool.py anim video.mp4)"
-	end
-	local v = {}
-	for key, val in string.gmatch(rest, "(%a+)=([%w%.]+)") do
-		v[key] = tonumber(val)
-	end
-	local function whole(n, lo, hi)
-		return type(n) == "number" and n == math.floor(n) and n >= lo and n <= hi
-	end
-	if not (whole(v.cols, 1, 16) and whole(v.rows, 1, 16) and whole(v.fw, 16, 1024) and whole(v.fh, 16, 1024) and whole(v.frames, 1, 240)) then
-		return nil, "the header numbers are missing or out of range"
-	end
-	if type(v.fps) ~= "number" or v.fps <= 0 or v.fps > 30 then
-		return nil, "fps must be above 0 and at most 30"
-	end
-	if v.cols * v.fw > 1024 or v.rows * v.fh > 1024 then
-		return nil, "a sheet is larger than 1024 px"
-	end
-	local per = v.cols * v.rows
-	return { cols = v.cols, rows = v.rows, fw = v.fw, fh = v.fh, fps = v.fps, frames = v.frames, per = per,
-		sheets = math.ceil(v.frames / per), duration = v.frames / v.fps }
-end
-
--- done(meta, assets) | done(nil, nil, reason). path is NovaUI/backgrounds/intro.anim.txt
-function AnimBG.resolve(path, done)
-	local okFile, exists = uncRun("background folder", "isfile", true, path)
-	if okFile and exists == false then
-		return done(nil, nil, "file not found: put it in workspace/" .. BG_FOLDER .. " (looked for " .. path .. ")")
-	end
-	local okRead, text, why = uncRun("background folder", "readfile", false, path)
-	if not okRead then
-		return done(nil, nil, tostring(why))
-	end
-	local meta, reason = AnimBG.parse(text)
-	if not meta then
-		return done(nil, nil, string.match(path, "([^/]+)$") .. " is not usable: " .. tostring(reason))
-	end
-	local stem = string.match(path, "^(.*)%.[aA][nN][iI][mM]%.[tT][xX][tT]$") or path
-	local assets, failure = {}, nil
-	for i = 1, meta.sheets do
-		resolveLocalFile(stem .. ".anim" .. i .. ".jpg", function(asset, reason2)
-			if asset then
-				assets[i] = asset
-			else
-				failure = failure or reason2
-			end
-		end)
-		if failure then
-			break
-		end
-	end
-	if failure then
-		return done(nil, nil, tostring(failure))
-	end
-	return done(meta, assets)
-end
-
--- One Heartbeat connection per window; it only does something while an animation is the background.
-function AnimBG.ensureLoop(win)
-	if win._animConn then
-		return
-	end
-	win._animConn = win:_connect(RunService.Heartbeat, function(dt)
-		local a = win._bgAnim
-		if not a or win._destroyed or win._closing or not win.Visible then
-			return
-		end
-		local m = a.meta
-		a.t = (a.t + (tonumber(dt) or 0)) % m.duration
-		local idx = math.floor(a.t * m.fps) % m.frames
-		if idx == a.idx then
-			return
-		end
-		a.idx = idx
-		local sheet = math.floor(idx / m.per) + 1
-		local within = idx % m.per
-		local label = a.labels[sheet]
-		if not label then
-			return
-		end
-		if a.shown ~= sheet then
-			if a.labels[a.shown] then
-				a.labels[a.shown].ImageTransparency = 1
-			end
-			label.ImageTransparency = 0
-			a.shown = sheet
-		end
-		label.ImageRectOffset = Vector2.new((within % m.cols) * m.fw, math.floor(within / m.cols) * m.fh)
-	end)
 end
 
 -- Pixels = { W, H, Data = "rrggbb..." } (row-major). Doubles as a one-frame colour map.
@@ -4584,7 +4479,6 @@ local function clearMedia(win)
 		win._bgMedia = nil
 		win._bgVideo = nil
 	end
-	win._bgAnim = nil
 end
 
 -- Colour matching ---------------------------------------------------------
@@ -4644,13 +4538,8 @@ function Library:_matchStep()
 	end
 	local map = bg.map
 	local frame = 1
-	if (self._bgVideo or self._bgAnim) and #map.Frames > 1 then
-		local tp
-		if self._bgVideo then
-			tp = self._bgVideo.TimePosition
-		else
-			tp = self._bgAnim.t
-		end
+	if self._bgVideo and #map.Frames > 1 then
+		local tp = self._bgVideo.TimePosition
 		if type(tp) == "number" then
 			frame = math.floor(tp / (map.Interval or 0.5)) % #map.Frames + 1
 		end
@@ -4741,8 +4630,7 @@ end
 -- SetBackground({ Video = id | link, Dim = 0.62, Glass = 0.2, Match = false, ColorMap = {...} })
 -- SetBackground({ Image = id | link, ... })   a still picture
 -- SetBackground({ Pixels = { W, H, Data }, ... })   a small embedded picture, no downloads at all
--- SetBackground({ Animation = "intro.anim.txt" })   pictures flipped like a video (tools/novaui_tool.py anim)
--- A string ending in .webm/.mp4 is a Video, .png/.jpg/.jpeg an Image, .anim.txt an Animation.
+-- A string ending in .webm/.mp4 is a Video, .png/.jpg/.jpeg an Image.
 -- Returns true when accepted. Media may still load later (asynchronously); failures never throw.
 function Library:SetBackground(spec)
 	if self._destroyed then
@@ -4754,9 +4642,7 @@ function Library:SetBackground(spec)
 	end
 	if type(spec) == "string" or type(spec) == "number" then
 		local lower = type(spec) == "string" and string.lower(string.match(spec, "^[^%?#]*") or "") or ""
-		if string.match(lower, "%.anim%.txt$") then
-			spec = { Animation = spec }
-		elseif string.match(lower, "%.webm$") or string.match(lower, "%.mp4$") then
+		if string.match(lower, "%.webm$") or string.match(lower, "%.mp4$") then
 			spec = { Video = spec }
 		elseif string.match(lower, "%.png$") or string.match(lower, "%.jpe?g$") then
 			spec = { Image = spec }
@@ -4774,13 +4660,6 @@ function Library:SetBackground(spec)
 		kind, source = "video", spec.Video
 	elseif spec.Image ~= nil then
 		kind, source = "image", spec.Image
-	elseif spec.Animation ~= nil then
-		kind, source = "anim", spec.Animation
-		local _, fileKind = localBgFile(source)
-		if fileKind ~= "anim" then
-			warn("[NovaUI] SetBackground: Animation must be a file name like intro.anim.txt from workspace/" .. BG_FOLDER)
-			return false
-		end
 	elseif spec.Pixels ~= nil then
 		kind, source = "pixels", spec.Pixels
 		if not validPixels(source) then
@@ -4788,7 +4667,7 @@ function Library:SetBackground(spec)
 			return false
 		end
 	else
-		warn("[NovaUI] SetBackground: give Video, Image, Animation or Pixels")
+		warn("[NovaUI] SetBackground: give Video, Image or Pixels")
 		return false
 	end
 	local sidecarMap, mapFile, mapProblem
@@ -4849,37 +4728,7 @@ function Library:SetBackground(spec)
 			return -- replaced or removed while loading
 		end
 		clearMedia(self)
-		if kind == "anim" then
-			local meta = asset.meta
-			local holder = create("Frame", {
-				Name = "BgAnim",
-				Size = UDim2.fromScale(1, 1),
-				BackgroundTransparency = 1,
-				BorderSizePixel = 0,
-				ClipsDescendants = true,
-				ZIndex = 1,
-				Parent = backdrop,
-			})
-			local labels = {}
-			for i, sheetAsset in ipairs(asset.sheets) do
-				labels[i] = create("ImageLabel", {
-					Name = "Sheet" .. i,
-					Size = UDim2.fromScale(1, 1),
-					BackgroundTransparency = 1,
-					BorderSizePixel = 0,
-					Image = sheetAsset,
-					ImageTransparency = i == 1 and 0 or 1, -- every sheet is loaded up front; only one is visible
-					ImageRectOffset = Vector2.new(0, 0),
-					ImageRectSize = Vector2.new(meta.fw, meta.fh),
-					ScaleType = Enum.ScaleType.Crop,
-					ZIndex = 1,
-					Parent = holder,
-				})
-			end
-			self._bgMedia = holder
-			self._bgAnim = { meta = meta, labels = labels, t = 0, idx = 0, shown = 1 }
-			AnimBG.ensureLoop(self)
-		elseif kind == "video" then
+		if kind == "video" then
 			local v = create("VideoFrame", {
 				Name = "BgVideo",
 				Size = UDim2.fromScale(1, 1),
@@ -4951,11 +4800,7 @@ function Library:SetBackground(spec)
 			fail(reason)
 		end
 	end
-	if kind == "anim" then
-		AnimBG.resolve(source, function(meta, assets, why)
-			handle(meta and { meta = meta, sheets = assets } or nil, why)
-		end)
-	elseif kind == "video" then
+	if kind == "video" then
 		resolveVideo(source, handle)
 	elseif kind == "image" then
 		resolveImageAny(source, function(asset, why, px)
@@ -5045,7 +4890,7 @@ end
 -- kind, source (still url-encoded), dim, glass, match | nil
 local function parseBgCode(code)
 	local kind, src, dim, glass, match = string.match(tostring(code), "^(%a+)|([^|]*)|([%d%.]+)|([%d%.]+)|([01])$")
-	if not kind or (kind ~= "video" and kind ~= "image" and kind ~= "anim") or not tonumber(dim) or not tonumber(glass) then
+	if not kind or (kind ~= "video" and kind ~= "image") or not tonumber(dim) or not tonumber(glass) then
 		return nil
 	end
 	return kind, src, tonumber(dim), tonumber(glass), match == "1"
@@ -5064,8 +4909,6 @@ function Library:_bgDecode(code)
 	end
 	if kind == "video" then
 		spec.Video = source
-	elseif kind == "anim" then
-		spec.Animation = source
 	else
 		spec.Image = source
 	end
@@ -5288,7 +5131,7 @@ end
 function Library:_buildBackgroundSettings(host, S)
 	local win = self
 	host:Section("Background  (video / image)")
-	S.bgNote = host:Label("Drop a .png / .jpg / .anim.txt (picture animation) or .webm into workspace/" .. BG_FOLDER .. ", press Refresh, pick it below.")
+	S.bgNote = host:Label("Easiest: drop a .webm / .mp4 / .png / .jpg into workspace/" .. BG_FOLDER .. ", press Refresh, pick it below.")
 
 	-- the folder: created on demand, listed through the executor's listfiles
 	local function ensureFolder(path)
@@ -5314,7 +5157,7 @@ function Library:_buildBackgroundSettings(host, S)
 		local seen = {}
 		for _, entry in ipairs(list) do
 			local name = string.match(tostring(entry), "([^/\\]+)$")
-			if name and not seen[name] and localBgFile(name) and not string.match(string.lower(name), "%.anim%d+%.jpe?g$") and #names < 100 then
+			if name and not seen[name] and localBgFile(name) and #names < 100 then
 				seen[name] = true
 				table.insert(names, name)
 			end
@@ -5327,11 +5170,11 @@ function Library:_buildBackgroundSettings(host, S)
 	local function useFile(name)
 		local path, fileKind = localBgFile(name)
 		if not path then
-			S.bgNote:Set("That is not a usable file name (letters, digits, space - . _ ( ) and .webm .mp4 .png .jpg .anim.txt).")
+			S.bgNote:Set("That is not a usable file name (letters, digits, space - . _ ( ) and .webm .mp4 .png .jpg).")
 			return
 		end
 		local spec = { Dim = win._bg and win._bg.dim, Glass = win._bg and win._bg.glass, Match = win._bg and win._bg.match }
-		spec[fileKind == "video" and "Video" or fileKind == "anim" and "Animation" or "Image"] = path
+		spec[fileKind == "video" and "Video" or "Image"] = path
 		win:_bgKeepMap(spec, path)
 		-- say "Loading" first: a folder file resolves at once, and its "ready" / error note must not be overwritten
 		S.bgNote:Set("Loading " .. name .. "...")
@@ -5346,7 +5189,7 @@ function Library:_buildBackgroundSettings(host, S)
 		if why then
 			S.bgNote:Set("Could not list the folder: " .. tostring(why))
 		elseif #names == 0 then
-			S.bgNote:Set("No files yet. Put a .anim.txt / .png / .jpg / .webm in workspace/" .. BG_FOLDER .. ", then press Refresh files.")
+			S.bgNote:Set("No files yet. Put a .webm / .mp4 / .png / .jpg in workspace/" .. BG_FOLDER .. ", then press Refresh files.")
 		else
 			S.bgNote:Set(#names .. " file(s) found in workspace/" .. BG_FOLDER .. ". Pick one in 'Files in folder'.")
 		end
@@ -5400,7 +5243,7 @@ function Library:_buildBackgroundSettings(host, S)
 			elseif mapName then
 				S.bgNote:Set("No colour map next to this file. Run  python3 tools/novaui_tool.py colormap " .. string.match(path, "([^/]+)$") .. " --sidecar  and put " .. mapName .. " in the same folder, then pick the file again.")
 			else
-				S.bgNote:Set(bg and "Colour matching needs a colour map for this video/image: make one with tools/novaui_tool.py (see INSTRUCTIONS.md), or use a Pixels picture." or "Set a background first.")
+				S.bgNote:Set(bg and "Colour matching needs a colour map for this video/image: make one with tools/novaui_tool.py (see README), or use a Pixels picture." or "Set a background first.")
 			end
 		else
 			S.bgNote:Set(on and "Buttons and text now follow the colours behind them (beta)." or "Colour matching off.")

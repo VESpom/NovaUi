@@ -212,54 +212,5 @@ with tempfile.TemporaryDirectory() as d:
     check(f.returncode != 0 and "Traceback" not in f.stderr and f.stderr.strip() != "", "a file that is not a video is a readable error")
     check(not os.path.exists(os.path.join(d, "fake.webm")), "and leaves no half file")
 
-    # anim: sprite sheets + NVANIM1 manifest (red for 1 s, then blue for 1 s)
-    ad = os.path.join(d, "anim")
-    os.makedirs(ad)
-    av = os.path.join(ad, "my clip.mp4")
-    ff("-f", "lavfi", "-i", "color=c=red:s=64x48:d=1", "-f", "lavfi", "-i", "color=c=blue:s=64x48:d=1",
-       "-filter_complex", "[0][1]concat=n=2:v=1:a=0", "-r", "10", av)
-    a = tool("anim", av, "--fps", "4", "--width", "64", "--cols", "2", "--rows", "2", "--map")
-    check(a.returncode == 0, "anim runs: " + a.stderr)
-    man = os.path.join(ad, "my clip.anim.txt")
-    check(os.path.isfile(man), "manifest written (a space in the name is allowed)")
-    head = open(man).read() if os.path.isfile(man) else ""
-    check(head == "NVANIM1 cols=2 rows=2 fw=64 fh=48 fps=4 frames=9\n", "manifest exact: %r" % head)
-    s1, s2 = os.path.join(ad, "my clip.anim1.jpg"), os.path.join(ad, "my clip.anim2.jpg")
-    s3 = os.path.join(ad, "my clip.anim3.jpg")  # the test video is 2.2 s long, so 9 frames at 4 fps: 4 + 4 + 1
-    check(os.path.isfile(s1) and os.path.isfile(s2) and os.path.isfile(s3) and not os.path.exists(os.path.join(ad, "my clip.anim4.jpg")), "3 sheets for 9 frames of 4")
-    if os.path.isfile(s1):
-        wh = probe(s1, "stream=width,height")["streams"][0]
-        check((wh["width"], wh["height"]) == (128, 96), "sheet is 2x2 cells: %s" % wh)
-
-    def cell_colour(path, col, row):
-        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vf", "crop=8:8:%d:%d,scale=1:1" % (col * 64 + 28, row * 48 + 20),
-                              "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
-        return tuple(raw[:3])
-    if os.path.isfile(s1) and os.path.isfile(s2):
-        r1 = cell_colour(s1, 0, 0)
-        check(r1[0] > 200 and r1[2] < 60, "first frame is red: %s" % (r1,))
-        b2 = cell_colour(s2, 0, 1)
-        check(b2[2] > 200 and b2[0] < 60, "frame 7 (sheet 2, row 2) is blue: %s" % (b2,))
-    mp = os.path.join(ad, "my clip.map.txt")
-    check(os.path.isfile(mp) and read_sidecar(mp) is not None, "--map writes the colour map next to it")
-    again = tool("anim", av, "--fps", "4", "--width", "64", "--cols", "2", "--rows", "2")
-    check(again.returncode != 0 and "--force" in again.stderr, "no silent overwrite")
-    # a shorter run with --force removes the old second sheet
-    short = tool("anim", av, "--fps", "1", "--width", "64", "--cols", "2", "--rows", "2", "--force")
-    check(short.returncode == 0 and re.search(r"frames=[23]\n", open(man).read()), "force replaces: " + short.stderr)
-    check(not os.path.exists(s2) and not os.path.exists(s3), "stale sheets removed")
-    for args, part in ((["anim", av, "--fps", "0"], "--fps"), (["anim", av, "--fps", "99"], "--fps"),
-                       (["anim", av, "--width", "10"], "--width"), (["anim", av, "--width", "5000"], "--width"),
-                       (["anim", av, "--quality", "99"], "--quality"),
-                       (["anim", av, "--width", "600", "--cols", "2", "--force"], "over 1024"),
-                       (["anim", os.path.join(ad, "nope.mp4")], "file not found")):
-        e = tool(*args)
-        check(e.returncode != 0 and "Traceback" not in e.stderr and part in e.stderr, "clean error for %s: %s" % (args[1:], e.stderr[-120:]))
-    longv = os.path.join(ad, "long.mp4")
-    ff("-f", "lavfi", "-i", "color=c=green:s=64x48:d=40", "-r", "10", longv)
-    lg = tool("anim", longv, "--fps", "10", "--width", "64", "--max-seconds", "0")
-    check(lg.returncode == 0 and "at most 240" in lg.stderr and "frames=240" in open(os.path.join(ad, "long.anim.txt")).read(),
-          "frame cap warned and applied: " + lg.stderr[-200:])
-
 print("tool tests: %s" % ("OK" if fails == 0 else "%d FAILED" % fails))
 sys.exit(1 if fails else 0)
