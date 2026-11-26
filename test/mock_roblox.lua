@@ -499,62 +499,71 @@ local CLASSES = {
 	Camera = { props = set({ "Name", "ViewportSize" }), signals = {}, defaults = function() return { ViewportSize = Vector2.new(1280, 720) } end },
 }
 
+-- Internals live under a private key, like in real Roblox where an Instance has no _class / _props / ...
+-- Reading one of those names from library code raises "X is not a valid member of Y", exactly as in Roblox.
+local KEY = {}
+local function st(obj)
+	return rawget(obj, KEY)
+end
+function M.classOf(obj) return st(obj).class end
+function M.propsOf(obj) return st(obj).props end
+
 local InstMT = {}
 local methods = {}
 
 local function removeChild(parent, child)
-	for i, c in ipairs(parent._children) do
+	for i, c in ipairs(st(parent).children) do
 		if c == child then
-			table.remove(parent._children, i)
+			table.remove(st(parent).children, i)
 			return
 		end
 	end
 end
 
 local function signalOf(obj, name)
-	local s = obj._signals[name]
+	local s = st(obj).signals[name]
 	if not s then
 		s = newSignal()
-		obj._signals[name] = s
+		st(obj).signals[name] = s
 	end
 	return s
 end
 
 local function setParent(obj, parent)
-	local old = rawget(obj, "_parent")
+	local old = st(obj).parent
 	if old then
 		removeChild(old, obj)
 	end
-	rawset(obj, "_parent", parent)
+	st(obj).parent = parent
 	if parent then
-		table.insert(parent._children, obj)
+		table.insert(st(parent).children, obj)
 		signalOf(parent, "ChildAdded"):Fire(obj)
 	end
 end
 
 function methods.Destroy(self)
-	if self._destroyed then
+	if st(self).destroyed then
 		return
 	end
-	self._destroyed = true
+	st(self).destroyed = true
 	signalOf(self, "Destroying"):Fire()
-	for _, child in ipairs({ unpack(self._children) }) do
+	for _, child in ipairs({ unpack(st(self).children) }) do
 		child:Destroy()
 	end
 	setParent(self, nil)
-	for _, sig in pairs(self._signals) do
+	for _, sig in pairs(st(self).signals) do
 		for _, c in ipairs(sig._conns) do
 			c.Connected = false
 		end
 	end
 end
 function methods.GetChildren(self)
-	return { unpack(self._children) }
+	return { unpack(st(self).children) }
 end
 function methods.GetDescendants(self)
 	local out = {}
 	local function walk(node)
-		for _, c in ipairs(node._children) do
+		for _, c in ipairs(st(node).children) do
 			table.insert(out, c)
 			walk(c)
 		end
@@ -563,13 +572,13 @@ function methods.GetDescendants(self)
 	return out
 end
 function methods.FindFirstChild(self, name, recursive)
-	for _, c in ipairs(self._children) do
-		if c._props.Name == name then
+	for _, c in ipairs(st(self).children) do
+		if st(c).props.Name == name then
 			return c
 		end
 	end
 	if recursive then
-		for _, c in ipairs(self._children) do
+		for _, c in ipairs(st(self).children) do
 			local found = methods.FindFirstChild(c, name, true)
 			if found then
 				return found
@@ -582,15 +591,15 @@ function methods.WaitForChild(self, name)
 	return methods.FindFirstChild(self, name)
 end
 function methods.IsA(self, className)
-	return self._class == className
+	return st(self).class == className
 end
 function methods.IsDescendantOf(self, other)
-	local p = rawget(self, "_parent")
+	local p = st(self).parent
 	while p do
 		if p == other then
 			return true
 		end
-		p = rawget(p, "_parent")
+		p = st(p).parent
 	end
 	return false
 end
@@ -604,30 +613,30 @@ function methods.Pause(self)
 	self.Playing = false
 end
 function methods.CaptureFocus(self)
-	self._focused = true
+	st(self).focused = true
 	signalOf(self, "Focused"):Fire()
 end
 function methods.ReleaseFocus(self, submitted)
-	if self._focused then
-		self._focused = false
+	if st(self).focused then
+		st(self).focused = false
 		signalOf(self, "FocusLost"):Fire(submitted == true)
 	end
 end
 
 InstMT.__index = function(self, key)
-	local def = CLASSES[rawget(self, "_class")]
+	local def = CLASSES[st(self).class]
 	if methods[key] then
 		return methods[key]
 	end
 	if key == "Parent" then
-		return rawget(self, "_parent")
+		return st(self).parent
 	elseif key == "ClassName" then
-		return rawget(self, "_class")
+		return st(self).class
 	end
 	if def.signals[key] or key == "Destroying" or key == "ChildAdded" then
 		return signalOf(self, key)
 	end
-	local value = self._props[key]
+	local value = st(self).props[key]
 	if value ~= nil then
 		return value
 	end
@@ -638,17 +647,17 @@ InstMT.__index = function(self, key)
 	if child then
 		return child
 	end
-	error(tostring(key) .. " is not a valid member of " .. rawget(self, "_class"), 2)
+	error(tostring(key) .. " is not a valid member of " .. st(self).class, 2)
 end
 
 InstMT.__newindex = function(self, key, value)
-	local def = CLASSES[rawget(self, "_class")]
+	local def = CLASSES[st(self).class]
 	if key == "Parent" then
 		setParent(self, value)
 		return
 	end
 	if not def.props[key] then
-		error(tostring(key) .. " is not a valid member of " .. rawget(self, "_class") .. " (cannot set)", 2)
+		error(tostring(key) .. " is not a valid member of " .. st(self).class .. " (cannot set)", 2)
 	end
 	if value == nil then
 		error("cannot set " .. key .. " to nil", 2)
@@ -665,10 +674,10 @@ InstMT.__newindex = function(self, key, value)
 	if key == "Color" and typeofValue(value) ~= "Color3" and typeofValue(value) ~= "ColorSequence" then
 		error("Color expects Color3 or ColorSequence, got " .. typeofValue(value), 2)
 	end
-	local old = self._props[key]
-	self._props[key] = value
+	local old = st(self).props[key]
+	st(self).props[key] = value
 	if old ~= value then
-		local sig = self._signals["Changed:" .. key]
+		local sig = st(self).signals["Changed:" .. key]
 		if sig then
 			sig:Fire()
 		end
@@ -681,8 +690,8 @@ function Instance.new(className)
 	if not def then
 		error("Unable to create an Instance of type '" .. tostring(className) .. "'")
 	end
-	local obj = { _class = className, _props = def.defaults(), _children = {}, _signals = {}, _destroyed = false }
-	obj._props.Name = className
+	local obj = { [KEY] = { class = className, props = def.defaults(), children = {}, signals = {}, destroyed = false } }
+	st(obj).props.Name = className
 	return setmetatable(obj, InstMT)
 end
 
@@ -720,6 +729,8 @@ function M.reset()
 	local playerGui = Instance.new("Folder")
 	services.Players = {
 		LocalPlayer = {
+			UserId = 424242,
+			Name = "Tester",
 			PlayerGui = playerGui,
 			WaitForChild = function(self, name)
 				return self.PlayerGui

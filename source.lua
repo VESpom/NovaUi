@@ -955,22 +955,6 @@ function Library:_hotkeyId(base)
 	return n == 1 and base or (base .. " #" .. n)
 end
 
--- Element state registry (what presets save besides hotkeys): every Toggle, Slider, Input, Dropdown and
--- ColorPicker registers { kind, get() -> string|nil, set(string, fire) -> bool } under "Tab/Label".
--- kinds: t toggle, s slider, i input, d dropdown, c colour. The window's own settings controls opt out.
-function Library:_addState(tab, kind, label, entry)
-	if tab._noState or self._destroyed then
-		return
-	end
-	local base = tab.Name .. "/" .. tostring(label)
-	local counterKey = kind .. "|" .. base
-	local n = (self._stateIds[counterKey] or 0) + 1
-	self._stateIds[counterKey] = n
-	entry.kind = kind
-	entry.id = n == 1 and base or (base .. " #" .. n)
-	table.insert(self._states, entry)
-end
-
 function Library:_keyTaken(code, except)
 	if code == self._toggleKey then
 		return true
@@ -1612,7 +1596,8 @@ end
 
 -- Alternatives that never touch the network or the executor's file functions:
 --   Image = { Pixels = { W, H, Data } }      a small picture embedded in the script (tools/novaui_tool.py makes it)
---   Image = { User = 1234 }                  Roblox avatar head shot (also Game / Group / Asset = id)
+--   Image = { User = 1234 }                  Roblox avatar head shot of that user (also Game / Group / Asset = id)
+--   Image = { User = "Local" }               the avatar of whoever is playing (the local player), whoever they are
 --   Image = "rbxthumb://type=..." or "rbxasset://..." strings
 --   Image = { "https://...", 12345, { Pixels = ... } }   a fallback list, tried in order
 -- done(asset) | done(nil, reason) | done(nil, nil, pixels)
@@ -1620,6 +1605,18 @@ local validPixels, renderPixels
 local THUMB_KINDS = {
 	User = "AvatarHeadShot", Game = "GameIcon", Group = "GroupIcon", Asset = "Asset",
 }
+-- User = "Local" (or "LocalPlayer" / "Me" / true): the person in game, instead of one fixed user id
+local LOCAL_USER_WORDS = { ["local"] = true, localplayer = true, me = true, player = true }
+local function localUserId()
+	local ok, id = pcall(function()
+		return Players.LocalPlayer.UserId
+	end)
+	if ok and type(id) == "number" and id > 0 and id == math.floor(id) then
+		return id
+	end
+	return nil
+end
+
 local resolveImageAny
 function resolveImageAny(src, done)
 	if type(src) == "string" and string.match(src, "^rbxthumb://type=%a+&id=%d+[%w=&_]*$") then
@@ -1637,9 +1634,15 @@ function resolveImageAny(src, done)
 	for key, kind in pairs(THUMB_KINDS) do
 		local id = src[key]
 		if id ~= nil then
+			if key == "User" and (id == true or (type(id) == "string" and LOCAL_USER_WORDS[string.lower(id)])) then
+				id = localUserId()
+				if not id then
+					return done(nil, 'User = "Local" needs a local player, and there is none here')
+				end
+			end
 			id = tonumber(id)
 			if not id or id <= 0 or id ~= math.floor(id) then
-				return done(nil, key .. " must be a positive number")
+				return done(nil, key .. ' must be a positive number (or "Local" for User)')
 			end
 			return done(string.format("rbxthumb://type=%s&id=%d&w=150&h=150", kind, id))
 		end
@@ -2363,9 +2366,6 @@ function Library.new(options)
 	self.Minimized = false
 	self._hotkeys = {}
 	self._hotkeyIds = {}
-	self._states = {}
-	self._stateIds = {}
-	self._presetFire = options.PresetCallbacks ~= false -- loading a preset runs the callbacks of what changed (default)
 	self._keepOnScreen = options.KeepOnScreen ~= false
 	self._showChips = options.Hotkeys ~= false -- Hotkeys = false hides the hotkey boxes (code-set Hotkey keys still work)
 
@@ -2582,6 +2582,9 @@ function Library.new(options)
 
 	if options.Background ~= nil then
 		self:SetBackground(options.Background)
+	end
+	if options.AutoBackground ~= false then
+		self:_autoLoadBackground() -- the user's saved "auto-load" background preset, if they turned it on
 	end
 
 	-- tooltip ------------------------------------------------------------
@@ -3293,18 +3296,6 @@ function Tab:Toggle(text, default, callback, opts)
 	end)
 	win:_attachTip(btn, opts.Tooltip)
 
-	win:_addState(self, "t", text, {
-		get = function()
-			return state and "1" or "0"
-		end,
-		set = function(v, fire)
-			if v ~= "1" and v ~= "0" then
-				return false
-			end
-			obj:Set(v == "1", not fire) -- the callback only runs when the value really changes
-			return true
-		end,
-	})
 	return obj
 end
 
@@ -3469,19 +3460,6 @@ function Tab:Slider(text, min, max, default, callback, opts)
 	win:_attachTip(card, opts.Tooltip)
 
 	render()
-	win:_addState(self, "s", text, {
-		get = function()
-			return string.format("%.6f", value)
-		end,
-		set = function(v, fire)
-			v = tonumber(v)
-			if not v or v ~= v or v == math.huge or v == -math.huge then
-				return false
-			end
-			apply(v, not fire)
-			return true
-		end,
-	})
 	return obj
 end
 
@@ -3536,22 +3514,6 @@ function Tab:Input(text, placeholder, callback, opts)
 	end)
 	win:_attachTip(card, opts.Tooltip)
 
-	win:_addState(self, "i", text, {
-		get = function()
-			return box.Text
-		end,
-		set = function(v, fire)
-			if type(v) ~= "string" then
-				return false
-			end
-			local changed = box.Text ~= v
-			box.Text = v
-			if changed and fire then
-				runGated(win, callback, v)
-			end
-			return true
-		end,
-	})
 	return {
 		Instance = row,
 		Get = function()
@@ -3678,7 +3640,7 @@ function Tab:Dropdown(text, list, callback, opts)
 	local items = {}
 	local buttons = {}
 	local open = false
-	local selected = nil -- last option chosen by the user or by Set / a preset
+	local selected = nil -- last option chosen by the user or by Set
 	local row = self:_row(ROW, "Dropdown")
 	local card = create("Frame", {
 		Name = "Card",
@@ -3834,17 +3796,6 @@ function Tab:Dropdown(text, list, callback, opts)
 		return true
 	end
 
-	win:_addState(self, "d", text, {
-		get = function()
-			return selected
-		end,
-		set = function(v, fire)
-			if type(v) ~= "string" then
-				return false
-			end
-			return choose(v, not fire)
-		end,
-	})
 	return {
 		Instance = row,
 		Refresh = function(_, newList)
@@ -3919,7 +3870,7 @@ function Tab:ColorPicker(text, default, callback, opts)
 		BorderSizePixel = 0,
 		Parent = card,
 	}, { listLayout(6) })
-	local host = setmetatable({ Window = win, Name = "ColorPanel", Page = panel, _order = 0, _noState = true }, Tab)
+	local host = setmetatable({ Window = win, Name = "ColorPanel", Page = panel, _order = 0 }, Tab)
 
 	local function push()
 		color = Color3.fromRGB(r, g, b)
@@ -3966,361 +3917,18 @@ function Tab:ColorPicker(text, default, callback, opts)
 			end
 		end,
 	}
-	win:_addState(self, "c", text, {
-		get = function()
-			return string.format("%02x%02x%02x", r, g, b)
-		end,
-		set = function(v, fire)
-			local c = type(v) == "string" and string.match(v, "^%x%x%x%x%x%x$") and Color3.fromRGB(tonumber(string.sub(v, 1, 2), 16), tonumber(string.sub(v, 3, 4), 16), tonumber(string.sub(v, 5, 6), 16))
-			if not c then
-				return false
-			end
-			if math.floor(c.R * 255 + 0.5) == r and math.floor(c.G * 255 + 0.5) == g and math.floor(c.B * 255 + 0.5) == b then
-				return true -- already this colour: nothing changes, no callback
-			end
-			picker:Set(c, not fire)
-			return true
-		end,
-	})
 	return picker
 end
 
 ----------------------------------------------------------------------
--- Settings panel (gear button): themes, colours, presets, window options
+-- Settings panel (gear button): themes, colours, window options, background (+ background presets)
 ----------------------------------------------------------------------
-
-local PRESET_FILE = "NovaUI/presets.txt"
-local PRESET_MAX_NAME = 24
-local PRESET_MAX = 40
-local SCHEME_LETTER = { SchemeColor = "S", Background = "B", Header = "H", TextColor = "T", ElementColor = "E" }
-
-local function toHex(c)
-	return string.format("%02x%02x%02x", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
-end
 
 local function fromHex(h)
 	if type(h) ~= "string" or not string.match(h, "^%x%x%x%x%x%x$") then
 		return nil
 	end
 	return Color3.fromRGB(tonumber(string.sub(h, 1, 2), 16), tonumber(string.sub(h, 3, 4), 16), tonumber(string.sub(h, 5, 6), 16))
-end
-
-local PRESET_MAX_CODE = 24000
-local PRESET_MAX_ENTRIES = 400
-
--- percent-encoding that leaves only letters, digits and - . _ ~ (so , : ; = | never appear inside a value)
-local function escField(s)
-	return (string.gsub(tostring(s), "[^%w%-%._~]", function(c)
-		return string.format("%%%02X", string.byte(c))
-	end))
-end
-
-local function unescField(s)
-	return (string.gsub(tostring(s), "%%(%x%x)", function(h)
-		return string.char(tonumber(h, 16))
-	end))
-end
-
--- What a preset remembers about the elements the script put in the window:
---   hotkeys  Y=id:Key,id:-          every Button / Toggle / Keybind hotkey ("-" = no key)
---   values   U=id:t:1,id:s:42.5,..  Toggle (t), Slider (s), Input (i), Dropdown (d), Colour (c)
-function Library:_captureState()
-	local y, u = {}, {}
-	for _, hk in ipairs(self._hotkeys) do
-		if #y < PRESET_MAX_ENTRIES then
-			local name = "-"
-			if hk.key then
-				local okName, n = pcall(function()
-					return hk.key.Name
-				end)
-				if okName and type(n) == "string" and string.match(n, "^%w+$") then
-					name = n
-				end
-			end
-			table.insert(y, escField(hk.id) .. ":" .. name)
-		end
-	end
-	for _, st in ipairs(self._states) do
-		if #u < PRESET_MAX_ENTRIES then
-			local okGet, v = pcall(st.get)
-			if okGet and type(v) == "string" then
-				table.insert(u, escField(st.id) .. ":" .. st.kind .. ":" .. escField(v))
-			end
-		end
-	end
-	return table.concat(y, ","), table.concat(u, ",")
-end
-
--- Look code: "NVP1;S=rrggbb;B=..;H=..;T=..;E=..;K=1[;G=<background code>|-][;Y=hotkeys][;U=values]".
--- Pure text, safe to paste around. Old codes without G / Y / U still load; fields missing = left alone.
-local function encodeLook(win)
-	local parts = { "NVP1" }
-	for _, key in ipairs(SCHEME_KEYS) do
-		table.insert(parts, SCHEME_LETTER[key] .. "=" .. toHex(win._scheme[key]))
-	end
-	table.insert(parts, "K=" .. (win._keepOnScreen and "1" or "0"))
-	if win._bgEncode then
-		local g = win:_bgEncode()
-		if g and g ~= "" then
-			table.insert(parts, "G=" .. g)
-		elseif win._bg == nil then
-			table.insert(parts, "G=-") -- no background: loading this preset removes the current one
-		end
-	end
-	local y, u = win:_captureState()
-	if y ~= "" then
-		table.insert(parts, "Y=" .. y)
-	end
-	if u ~= "" then
-		table.insert(parts, "U=" .. u)
-	end
-	return table.concat(parts, ";")
-end
-
-local function parseHotkeyField(v)
-	local list = {}
-	for item in string.gmatch(v, "[^,]+") do
-		if #list >= PRESET_MAX_ENTRIES then
-			break
-		end
-		local id, key = string.match(item, "^([^:]+):(%w+)$")
-		if not id then
-			id, key = string.match(item, "^([^:]+):(%-)$")
-		end
-		if id then
-			table.insert(list, { id = unescField(id), key = key ~= "-" and key or nil })
-		end
-	end
-	return list
-end
-
-local function parseValueField(v)
-	local list = {}
-	for item in string.gmatch(v, "[^,]+") do
-		if #list >= PRESET_MAX_ENTRIES then
-			break
-		end
-		local id, kind, value = string.match(item, "^([^:]+):(%a):([^:]*)$")
-		if id then
-			table.insert(list, { id = unescField(id), kind = kind, value = unescField(value) })
-		end
-	end
-	return list
-end
-
-local function decodeLook(code)
-	if type(code) ~= "string" then
-		return nil, "empty"
-	end
-	code = string.gsub(code, "^%s+", "")
-	code = string.gsub(code, "%s+$", "")
-	if #code > PRESET_MAX_CODE then
-		return nil, "too long"
-	end
-	local fields = {}
-	for piece in string.gmatch(code, "[^;]+") do
-		table.insert(fields, piece)
-	end
-	if fields[1] ~= "NVP1" then
-		return nil, "not a NovaUI preset"
-	end
-	local look = { scheme = {} }
-	for i = 2, #fields do
-		local k, v = string.match(fields[i], "^(%a)=(.*)$")
-		if k then
-			for key, letter in pairs(SCHEME_LETTER) do
-				if letter == k then
-					local c = fromHex(v)
-					if not c then
-						return nil, "bad colour for " .. key
-					end
-					look.scheme[key] = c
-				end
-			end
-			if k == "K" then
-				look.keep = v ~= "0"
-			elseif k == "G" then
-				look.bg = v
-			elseif k == "Y" then
-				look.hotkeys = parseHotkeyField(v)
-			elseif k == "U" then
-				look.states = parseValueField(v)
-			end
-		end
-	end
-	for _, key in ipairs(SCHEME_KEYS) do
-		if not look.scheme[key] then
-			return nil, "missing " .. key
-		end
-	end
-	return look
-end
-
--- presets are shared by every window in this session and saved to disk when the executor can
-local presetStore = nil
-local function presets()
-	if presetStore then
-		return presetStore
-	end
-	presetStore = { names = {}, codes = {} }
-	-- no file yet is normal (first run); only a function that exists but throws is blamed on the executor
-	local text = nil
-	local okExists, exists = uncRun("presets", "isfile", true, PRESET_FILE)
-	if okExists and exists == false then
-		return presetStore
-	end
-	if okExists or not uncFn("isfile") then
-		local read = uncFn("readfile")
-		if read then
-			local okRead, body
-			if okExists then
-				okRead, body = uncRun("presets", "readfile", true, PRESET_FILE)
-			else
-				okRead, body = pcall(read, PRESET_FILE) -- isfile is missing: a failed read just means no file yet
-			end
-			if okRead and type(body) == "string" then
-				text = body
-			end
-		end
-	end
-	if text then
-		for line in string.gmatch(text, "[^\r\n]+") do
-			local name, code = string.match(line, "^([^\t]+)\t(.+)$")
-			if name and #presetStore.names < PRESET_MAX and decodeLook(code) then
-				if not presetStore.codes[name] then
-					table.insert(presetStore.names, name)
-				end
-				presetStore.codes[name] = code
-			end
-		end
-	end
-	return presetStore
-end
-
--- returns true, or false + a plain-words reason that names the executor function at fault
-local function persistPresets()
-	local store = presets()
-	local lines = {}
-	for _, name in ipairs(store.names) do
-		table.insert(lines, name .. "\t" .. store.codes[name])
-	end
-	local okFolder, hasFolder = uncRun("presets", "isfolder", true, "NovaUI")
-	if not (okFolder and hasFolder) then
-		uncRun("presets", "makefolder", true, "NovaUI") -- a failure is recorded; writefile below says whether it mattered
-	end
-	local ok, _, why = uncRun("presets", "writefile", false, PRESET_FILE, table.concat(lines, "\n"))
-	return ok, why
-end
-
-local function cleanPresetName(text)
-	text = tostring(text or "")
-	text = string.gsub(text, "[%c\t;=]", "")
-	text = string.gsub(text, "^%s+", "")
-	text = string.gsub(text, "%s+$", "")
-	return string.sub(text, 1, PRESET_MAX_NAME)
-end
-
--- Puts the saved hotkeys and element values back. Elements are matched by "Tab/Label" (+ " #2" for twins);
--- anything the preset does not mention is left alone, anything it mentions that is gone is counted.
--- Hotkeys are cleared first and re-bound second, so two hotkeys can swap keys inside one preset.
-function Library:_applyElements(look)
-	local stats = { keys = 0, values = 0, missing = 0, keyConflicts = 0 }
-	if look.hotkeys then
-		local byId = {}
-		for _, hk in ipairs(self._hotkeys) do
-			byId[hk.id] = hk
-		end
-		local plan, planned = {}, {}
-		for _, item in ipairs(look.hotkeys) do
-			local hk = byId[item.id]
-			if hk and planned[hk] then
-				hk = nil -- the same id twice in one code: the first entry wins
-			elseif hk then
-				planned[hk] = true
-			end
-			if not hk then
-				stats.missing = stats.missing + 1
-			elseif item.key == nil then
-				table.insert(plan, { hk = hk, prev = hk.key, code = nil })
-			else
-				local okKey, code = pcall(function()
-					return Enum.KeyCode[item.key]
-				end)
-				if okKey and isKeyCode(code) and code ~= Enum.KeyCode.Unknown then
-					table.insert(plan, { hk = hk, prev = hk.key, code = code })
-				else
-					stats.keyConflicts = stats.keyConflicts + 1
-				end
-			end
-		end
-		for _, p in ipairs(plan) do
-			p.hk:SetKey(nil, true)
-		end
-		for _, p in ipairs(plan) do
-			local final = p.code
-			if final and self:_keyTaken(final, p.hk) then
-				stats.keyConflicts = stats.keyConflicts + 1
-				final = (p.prev and not self:_keyTaken(p.prev, p.hk)) and p.prev or nil
-			end
-			p.hk:SetKey(final, final == p.prev) -- tell OnHotkeyChanged only when the key really changed
-			if final == p.code then
-				stats.keys = stats.keys + 1
-			end
-		end
-	end
-	if look.states then
-		local byKey = {}
-		for _, st in ipairs(self._states) do
-			byKey[st.kind .. "\0" .. st.id] = st
-		end
-		for _, item in ipairs(look.states) do
-			local st = byKey[item.kind .. "\0" .. item.id]
-			if not st then
-				stats.missing = stats.missing + 1
-			else
-				local okSet, applied = pcall(st.set, item.value, self._presetFire)
-				if okSet and applied then
-					stats.values = stats.values + 1
-				else
-					stats.missing = stats.missing + 1
-				end
-			end
-		end
-	end
-	return stats
-end
-
--- returns a short plain-words summary of what was restored, e.g. "7 settings, 3 hotkeys (2 not found in this script)"
-function Library:_applyLook(look)
-	Library._recolor(self, look.scheme)
-	if look.keep ~= nil then
-		self._keepOnScreen = look.keep
-		if look.keep then
-			self:_settle(self._main)
-		end
-	end
-	if look.bg == "-" then
-		if self.ClearBackground then
-			self:ClearBackground()
-		end
-	elseif look.bg and self._bgDecode then
-		self:_bgDecode(look.bg)
-	end
-	local stats = self:_applyElements(look)
-	if self._syncSettings then
-		self:_syncSettings()
-	end
-	if not (look.hotkeys or look.states) then
-		return ""
-	end
-	local text = stats.values .. " settings, " .. stats.keys .. " hotkeys restored"
-	if stats.missing > 0 then
-		text = text .. ", " .. stats.missing .. " not found in this script"
-	end
-	if stats.keyConflicts > 0 then
-		text = text .. ", " .. stats.keyConflicts .. " hotkeys skipped (key already used)"
-	end
-	return text
 end
 
 function Library:IsSettingsOpen()
@@ -4355,11 +3963,12 @@ function Library:_buildSettings()
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		Parent = panel,
 	}, { listLayout(8), padding(16, 12, 18, 14) })
-	local host = setmetatable({ Window = self, Name = "Settings", Page = page, _order = 0, _noState = true }, Tab)
+	local host = setmetatable({ Window = self, Name = "Settings", Page = page, _order = 0 }, Tab)
 	local S = { panel = panel, page = page, host = host, pickers = {} }
 	self._settings = S
 
 	host:Section("Appearance")
+	S.status = host:Label("Pick a theme or change a colour: it applies right away.")
 	local names = {}
 	for name in pairs(SCHEMES) do
 		table.insert(names, name)
@@ -4392,79 +4001,6 @@ function Library:_buildSettings()
 		S.status:Set("Colours reset")
 	end)
 
-	host:Section("Presets")
-	S.status = host:Label("Save your look as a preset, or paste a preset code below.")
-	local nameBox = ""
-	S.nameInput = host:Input("Preset name", "e.g. Night mode", function(text)
-		nameBox = text
-	end, { FireOnBlur = true })
-	local selected = nil
-	S.presetDropdown = host:Dropdown("Load preset", presets().names, function(name)
-		selected = name
-		local code = presets().codes[name]
-		local look = code and decodeLook(code)
-		if look then
-			local summary = win:_applyLook(look)
-			S.status:Set("Loaded '" .. name .. "'" .. (summary ~= "" and (": " .. summary) or ""))
-		end
-	end)
-	function S.refreshPresets()
-		S.presetDropdown:Refresh(presets().names)
-	end
-	host:Button("Save preset", function()
-		local name = cleanPresetName(nameBox ~= "" and nameBox or S.nameInput:Get())
-		if name == "" then
-			S.status:Set("Type a preset name first.")
-			return
-		end
-		local store = presets()
-		if not store.codes[name] then
-			if #store.names >= PRESET_MAX then
-				S.status:Set("Preset limit reached (" .. PRESET_MAX .. "). Delete one first.")
-				return
-			end
-			table.insert(store.names, name)
-		end
-		store.codes[name] = encodeLook(win)
-		selected = name
-		S.refreshPresets()
-		local saved, why = persistPresets()
-		S.status:Set("Saved '" .. name .. "'" .. (saved and " (kept on disk)" or (" (this session only: " .. tostring(why or "your executor has no file access") .. ")")))
-	end)
-	host:Button("Delete selected preset", function()
-		local store = presets()
-		if not selected or not store.codes[selected] then
-			S.status:Set("Pick a preset in 'Load preset' first.")
-			return
-		end
-		store.codes[selected] = nil
-		for i, n in ipairs(store.names) do
-			if n == selected then
-				table.remove(store.names, i)
-				break
-			end
-		end
-		S.status:Set("Deleted '" .. selected .. "'")
-		selected = nil
-		S.refreshPresets()
-		persistPresets()
-	end)
-	host:Button("Export look (copy code)", function()
-		local code = encodeLook(win)
-		local copied = uncRun("export", "setclipboard", false, code) -- also tries toclipboard
-		S.codeInput:Set(code)
-		S.status:Set(copied and "Look code copied to your clipboard." or "Look code is in the box below: copy it from there.")
-	end)
-	S.codeInput = host:Input("Look code", "paste a code, press Enter", function(text)
-		local look, err = decodeLook(text)
-		if not look then
-			S.status:Set("Could not import: " .. tostring(err))
-			return
-		end
-		local summary = win:_applyLook(look)
-		S.status:Set("Imported look" .. (summary ~= "" and (": " .. summary) or "."))
-	end)
-
 	host:Section("Window")
 	S.keepToggle = host:Toggle("Keep window on screen", win._keepOnScreen, function(on)
 		win._keepOnScreen = on
@@ -4486,7 +4022,7 @@ function Library:_buildSettings()
 	return S
 end
 
--- pulls the controls in line with the live scheme (after theme / preset / reset changes)
+-- pulls the controls in line with the live scheme (after theme / reset changes)
 function Library:_syncSettings()
 	local S = self._settings
 	if not S then
@@ -4880,7 +4416,7 @@ function Library:_bgApplyGlass(duration)
 	local glass = bg and bg.glassUsed or 0
 	local seen = self._glassed
 	for _, d in ipairs(self._main:GetDescendants()) do
-		if d.Name ~= "Scrim" and (d._class == "Frame" or d._class == "TextButton" or d._class == "CanvasGroup" or d._class == "ScrollingFrame") then
+		if d.Name ~= "Scrim" and (d.ClassName == "Frame" or d.ClassName == "TextButton" or d.ClassName == "CanvasGroup" or d.ClassName == "ScrollingFrame") then
 			local inBackdrop = self._backdrop ~= nil and d:IsDescendantOf(self._backdrop)
 			if not inBackdrop and d ~= self._main then
 				local isBar = d.Name == "TopBar" or d.Name == "Sidebar"
@@ -4897,7 +4433,7 @@ function Library:_bgApplyGlass(duration)
 							if isBar then
 								t = glass * 0.7 -- bars carry the title and tabs: keep them a bit more solid
 							end
-							if d._class == "TextButton" and d.Name == "Tab" then
+							if d.ClassName == "TextButton" and d.Name == "Tab" then
 								t = 1
 							end
 							tween(d, duration or 0, { BackgroundTransparency = t })
@@ -4952,7 +4488,7 @@ function Library:_matchGather()
 	local recs = self._matchRecs
 	for _, d in ipairs(self._main:GetDescendants()) do
 		if not recs[d] and not (self._backdrop and d:IsDescendantOf(self._backdrop)) then
-			local cls = d._class
+			local cls = d.ClassName
 			if cls == "Frame" or cls == "TextButton" or cls == "CanvasGroup" then
 				local isBar = d.Name == "TopBar" or d.Name == "Sidebar"
 				if d.BackgroundTransparency < 1 then
@@ -5138,7 +4674,7 @@ function Library:SetBackground(spec)
 	if kind ~= "pixels" then
 		local fullPath = localBgFile(source)
 		if fullPath then
-			source = fullPath -- "intro.webm" is remembered (and saved in presets) as NovaUI/backgrounds/intro.webm
+			source = fullPath -- "intro.webm" is remembered (and saved in background presets) as NovaUI/backgrounds/intro.webm
 			if spec.ColorMap == nil then
 				-- intro.map.txt next to intro.webm is its colour map (a ColorMap given in the call wins)
 				sidecarMap, mapFile, mapProblem = loadSidecar(fullPath)
@@ -5341,22 +4877,32 @@ function Library:SetBackgroundMatch(on)
 	return true
 end
 
--- presets keep the type, source and levels (colour maps and Pixels are too big to embed)
+-- A background preset keeps the type, source and levels. Only a file name, asset id or link fits: a Pixels
+-- picture or a Game/User icon is a table, and colour maps are too big (a folder file finds its own .map.txt).
 function Library:_bgEncode()
 	local bg = self._bg
-	if not bg or not bg.source then
+	if not bg or (type(bg.source) ~= "string" and type(bg.source) ~= "number") then
 		return nil
 	end
 	return table.concat({ bg.kind, urlEncode(tostring(bg.source)), string.format("%.2f", bg.dim), string.format("%.2f", bg.glass), bg.match and "1" or "0" }, "|")
 end
 
-function Library:_bgDecode(code)
+-- kind, source (still url-encoded), dim, glass, match | nil
+local function parseBgCode(code)
 	local kind, src, dim, glass, match = string.match(tostring(code), "^(%a+)|([^|]*)|([%d%.]+)|([%d%.]+)|([01])$")
-	if not kind or (kind ~= "video" and kind ~= "image") then
+	if not kind or (kind ~= "video" and kind ~= "image") or not tonumber(dim) or not tonumber(glass) then
+		return nil
+	end
+	return kind, src, tonumber(dim), tonumber(glass), match == "1"
+end
+
+function Library:_bgDecode(code)
+	local kind, src, dim, glass, match = parseBgCode(code)
+	if not kind then
 		return false
 	end
 	-- Match is asked for here; SetBackground keeps it only when the new background has a map (sidecar or kept)
-	local spec = { Dim = tonumber(dim), Glass = tonumber(glass), Match = match == "1" }
+	local spec = { Dim = dim, Glass = glass, Match = match }
 	local source = urlDecode(src)
 	if string.match(source, "^%d+$") then
 		source = tonumber(source)
@@ -5370,7 +4916,7 @@ function Library:_bgDecode(code)
 	return self:SetBackground(spec)
 end
 
--- A colour map belongs to one video. When the same background is set again (a preset, the Source box) the
+-- A colour map belongs to one video. When the same background is set again (a background preset, the Source box) the
 -- map in use is kept; a different one never inherits it (a folder file finds its own intro.map.txt instead).
 function Library:_bgKeepMap(spec, source)
 	local bg = self._bg
@@ -5397,6 +4943,187 @@ function Library:_onRecolor()
 			self:_matchStep()
 		end
 	end
+end
+
+-- Background presets ----------------------------------------------------------
+-- The only presets NovaUI has: a name for a background (type, source, dim, glass, match). They live in
+-- workspace/NovaUI/bg_presets.txt, one "name<TAB>code" per line; "@auto<TAB>name" marks the preset that
+-- loads by itself whenever the UI is created. Shared by every window of the session.
+local BGP_FILE = "NovaUI/bg_presets.txt"
+local BGP_MAX = 40
+local BGP_MAX_NAME = 24
+local bgpStore = nil
+
+local function cleanBgPresetName(text)
+	text = string.gsub(tostring(text or ""), "[%c@]", "") -- tabs / newlines, and @ (kept for the auto marker)
+	text = string.gsub(text, "^%s+", "")
+	text = string.sub(text, 1, BGP_MAX_NAME)
+	return (string.gsub(text, "%s+$", ""))
+end
+
+local function bgPresets()
+	if bgpStore then
+		return bgpStore
+	end
+	bgpStore = { names = {}, codes = {}, auto = nil }
+	-- no file yet is normal (first run); only a function that exists but throws is blamed on the executor
+	local text = nil
+	local okExists, exists = uncRun("background presets", "isfile", true, BGP_FILE)
+	if okExists and exists == false then
+		return bgpStore
+	end
+	if okExists or not uncFn("isfile") then
+		local read = uncFn("readfile")
+		if read then
+			local okRead, body
+			if okExists then
+				okRead, body = uncRun("background presets", "readfile", true, BGP_FILE)
+			else
+				okRead, body = pcall(read, BGP_FILE) -- isfile is missing: a failed read just means no file yet
+			end
+			if okRead and type(body) == "string" then
+				text = body
+			end
+		end
+	end
+	if text then
+		local auto = nil
+		for line in string.gmatch(text, "[^\r\n]+") do
+			local name, code = string.match(line, "^([^\t]+)\t(.+)$")
+			if name == "@auto" then
+				auto = code
+			elseif name and #bgpStore.names < BGP_MAX and cleanBgPresetName(name) == name and parseBgCode(code) then
+				if not bgpStore.codes[name] then
+					table.insert(bgpStore.names, name)
+				end
+				bgpStore.codes[name] = code
+			end
+		end
+		if auto and bgpStore.codes[auto] then
+			bgpStore.auto = auto
+		end
+	end
+	return bgpStore
+end
+
+-- returns true, or false + a plain-words reason that names the executor function at fault
+local function persistBgPresets()
+	local store = bgPresets()
+	local lines = {}
+	for _, name in ipairs(store.names) do
+		table.insert(lines, name .. "\t" .. store.codes[name])
+	end
+	if store.auto and store.codes[store.auto] then
+		table.insert(lines, "@auto\t" .. store.auto)
+	end
+	local okFolder, hasFolder = uncRun("background presets", "isfolder", true, "NovaUI")
+	if not (okFolder and hasFolder) then
+		uncRun("background presets", "makefolder", true, "NovaUI") -- a failure is recorded; writefile below says whether it mattered
+	end
+	local ok, _, why = uncRun("background presets", "writefile", false, BGP_FILE, table.concat(lines, "\n"))
+	return ok, why
+end
+
+local function keptNote(ok, why)
+	return ok and " (kept on disk)" or (" (this session only: " .. tostring(why or "your executor has no file access") .. ")")
+end
+
+-- Window:GetBackgroundPresets() -> { names }          Window:GetAutoBackgroundPreset() -> name | nil
+-- Window:SaveBackgroundPreset(name) / LoadBackgroundPreset(name) / DeleteBackgroundPreset(name)
+-- Window:SetAutoBackgroundPreset(name | nil)           (nil = off)
+-- The last four return ok, message (the message is what the settings page shows).
+function Library:GetBackgroundPresets()
+	local out = {}
+	for i, name in ipairs(bgPresets().names) do
+		out[i] = name
+	end
+	return out
+end
+
+function Library:GetAutoBackgroundPreset()
+	return bgPresets().auto
+end
+
+function Library:SaveBackgroundPreset(name)
+	name = cleanBgPresetName(name)
+	if name == "" then
+		return false, "Type a preset name first."
+	end
+	local code = self:_bgEncode()
+	if not code then
+		return false, self._bg and "Only a file, asset id or link can be kept in a preset (not a Pixels picture or an icon)." or "Set a background first, then save it."
+	end
+	local store = bgPresets()
+	if not store.codes[name] then
+		if #store.names >= BGP_MAX then
+			return false, "Preset limit reached (" .. BGP_MAX .. "). Delete one first."
+		end
+		table.insert(store.names, name)
+	end
+	store.codes[name] = code
+	self._bgPresetSelected = name
+	local ok, why = persistBgPresets()
+	return true, "Saved '" .. name .. "'" .. keptNote(ok, why)
+end
+
+function Library:LoadBackgroundPreset(name)
+	local code = bgPresets().codes[name]
+	if not code then
+		return false, "There is no preset called '" .. tostring(name) .. "'."
+	end
+	self._bgPresetSelected = name
+	if self:_bgDecode(code) then
+		return true, "Loaded '" .. name .. "'"
+	end
+	return false, "Could not apply '" .. name .. "'."
+end
+
+function Library:DeleteBackgroundPreset(name)
+	local store = bgPresets()
+	if not name or not store.codes[name] then
+		return false, "Pick a preset in 'Load preset' first."
+	end
+	store.codes[name] = nil
+	for i, n in ipairs(store.names) do
+		if n == name then
+			table.remove(store.names, i)
+			break
+		end
+	end
+	if store.auto == name then
+		store.auto = nil
+	end
+	if self._bgPresetSelected == name then
+		self._bgPresetSelected = nil
+	end
+	local ok, why = persistBgPresets()
+	return true, "Deleted '" .. name .. "'" .. (ok and "" or keptNote(ok, why))
+end
+
+function Library:SetAutoBackgroundPreset(name)
+	local store = bgPresets()
+	if not name then
+		store.auto = nil
+		local ok, why = persistBgPresets()
+		return true, "Auto-load is off" .. (ok and "" or keptNote(ok, why))
+	end
+	if not store.codes[name] then
+		return false, "There is no preset called '" .. tostring(name) .. "'."
+	end
+	store.auto = name
+	local ok, why = persistBgPresets()
+	return true, "'" .. name .. "' will load by itself when the UI opens" .. keptNote(ok, why)
+end
+
+-- called while the window is built: the auto preset (the user's own choice) replaces a script's default Background
+function Library:_autoLoadBackground()
+	local store = bgPresets()
+	local name = store.auto
+	if not name or not store.codes[name] then
+		return false
+	end
+	self._bgPresetSelected = name
+	return self:_bgDecode(store.codes[name])
 end
 
 -- Settings controls ----------------------------------------------------------
@@ -5526,6 +5253,61 @@ function Library:_buildBackgroundSettings(host, S)
 		win:ClearBackground()
 		S.bgNote:Set("Background removed.")
 	end, { Hotkey = false })
+
+	-- background presets: save the current background under a name, load it later, optionally by itself
+	host:Section("Background presets")
+	S.bgPresetNote = host:Label("Save the current background under a name, load it later, or let one load by itself.")
+	local presetName = ""
+	S.bgPresetName = host:Input("Preset name", "e.g. Night city", function(text)
+		presetName = text
+	end, { FireOnBlur = true })
+	local function autoText()
+		local auto = win:GetAutoBackgroundPreset()
+		return auto and ("Auto-load: '" .. auto .. "'.") or "Auto-load: off."
+	end
+	function S.refreshBgPresets()
+		S.bgPresetList:Refresh(win:GetBackgroundPresets())
+		local auto = win:GetAutoBackgroundPreset()
+		S.syncing = true
+		S.bgAuto:Set(auto ~= nil and auto == win._bgPresetSelected, true)
+		S.syncing = false
+	end
+	S.bgPresetList = host:Dropdown("Load preset", win:GetBackgroundPresets(), function(name)
+		local _, msg = win:LoadBackgroundPreset(name)
+		S.refreshBgPresets()
+		S.bgPresetNote:Set(msg .. ". " .. autoText())
+	end)
+	S.bgAuto = host:Toggle("Auto-load this preset on start", false, function(on)
+		if S.syncing then
+			return
+		end
+		if on then
+			local pick = win._bgPresetSelected
+			local ok, msg = false, nil
+			if pick then
+				ok, msg = win:SetAutoBackgroundPreset(pick)
+			end
+			S.bgPresetNote:Set(ok and msg or "Pick or save a preset first.")
+		else
+			local _, msg = win:SetAutoBackgroundPreset(nil)
+			S.bgPresetNote:Set(msg)
+		end
+		S.refreshBgPresets()
+	end, { Hotkey = false })
+	host:Button("Save background preset", function()
+		local _, msg = win:SaveBackgroundPreset(presetName ~= "" and presetName or S.bgPresetName:Get())
+		S.refreshBgPresets()
+		S.bgPresetNote:Set(msg .. " " .. autoText())
+	end, { Hotkey = false })
+	host:Button("Delete selected preset", function()
+		local _, msg = win:DeleteBackgroundPreset(win._bgPresetSelected)
+		S.refreshBgPresets()
+		S.bgPresetNote:Set(msg .. " " .. autoText())
+	end, { Hotkey = false })
+	if win._bgPresetSelected then
+		S.bgPresetList:Set(win._bgPresetSelected, true)
+	end
+	S.refreshBgPresets()
 	self._bgStatus = function(status)
 		if string.sub(status, 1, 6) == "failed" then
 			S.bgNote:Set("Could not load it (" .. string.sub(status, 9) .. ")")
@@ -5883,7 +5665,7 @@ function Library.UNCTest(options)
 	do
 		local kind = call("setclipboard")
 		if kind == "missing" then
-			add("setclipboard", "MISSING", "no setclipboard / toclipboard (optional: the look code is shown in a box instead)", true)
+			add("setclipboard", "MISSING", "no setclipboard / toclipboard (optional: only the key-link button needs it)", true)
 		else
 			add("setclipboard", "PASS", "setclipboard / toclipboard exists (not called, so your clipboard is untouched)", true)
 		end
@@ -6077,7 +5859,7 @@ function Library.UNCTest(options)
 			out("[NovaUI UNC] feature  " .. title .. ": " .. entry.Note)
 		end
 	end
-	feature("Presets saved to disk", { "writefile", "readfile", "isfile" }, "Presets still work for this session only.")
+	feature("Background presets saved to disk", { "writefile", "readfile", "isfile" }, "Background presets still work for this session only, and cannot auto-load next time.")
 	feature("Backgrounds from the NovaUI/backgrounds folder", { "getcustomasset (webm)", "getcustomasset (png)", "isfile" }, "You can still use asset ids or Pixels backgrounds.")
 	feature("File picker for the folder", { "listfiles" }, "Type the file name in the Source box instead.")
 	feature("Images / videos from links", { "writefile", "getcustomasset (png)" }, "Use asset ids or the folder instead.")

@@ -18,7 +18,7 @@ By default the UI shows an Enter button, then a loading bar, then opens. Pass `L
 
 Executor behaviour: parents to `gethui()`, else CoreGui, else PlayerGui. Re-running the script replaces the old window (via `getgenv().__NovaUI`). RightShift hides/shows the UI.
 
-**New to this? Read [INSTRUCTIONS.md](INSTRUCTIONS.md)**: presets, folder backgrounds and the executor check, step by step.
+**New to this? Read [INSTRUCTIONS.md](INSTRUCTIONS.md)**: folder backgrounds, background presets and the executor check, step by step.
 
 Files: `source.lua` (the library), `unc_test.lua` (executor check, no window), `example.lua` (every call, Kavo style), `example_native.lua` (NovaUI's own API: 5 button styles, tooltips, notifications).
 In Studio or your own game without an executor, put `source.lua` in a ModuleScript and `require` it.
@@ -67,6 +67,7 @@ Limits: PNG or JPEG only (no webp/gif), up to 8 MB. If anything fails (old execu
 |---|---|---|
 | Embedded picture | `Image = { Pixels = <table> }` | Works in **any** executor and Studio, no network. Make it with `python3 tools/novaui_tool.py pixels logo.png --size 32` and paste the output. Up to 64x64: great for logos and icons, not photos. |
 | Roblox thumbnails | `Image = { User = 1234 }` (or `Game`, `Group`, `Asset`) | Avatar head shot, game icon, group icon or asset thumbnail. Nothing to upload or download. |
+| The person in game | `Image = { User = "Local" }` | The avatar of whoever is playing (also `"LocalPlayer"`, `"Me"` or `true`). Use a number for one fixed user, `"Local"` for everyone's own face; works inside a fallback list too. With no local player (a server, Studio edit mode) it is skipped and the next entry is used. |
 | Fallback list | `Image = { "https://...png", 123456, { Pixels = ... } }` | Tried in order; the first that works wins. Put a Pixels picture last as a guaranteed fallback. |
 
 Discord: a Discord image works if it is a direct `.png`/`.jpg` link, but Discord attachment links carry an expiry (`?ex=...`) and stop working later. For a permanent logo, put the file in your GitHub repo and use its `raw.githubusercontent.com` link, or upload it to Roblox and use the asset id.
@@ -76,10 +77,9 @@ Discord: a Discord image works if it is a direct `.png`/`.jpg` link, but Discord
 The gear next to minimise/close opens a settings page (click it again, or pick a tab, to go back):
 
 - **Appearance**: theme dropdown (all 8 themes), colour pickers for accent, window, header/sidebar, buttons/rows and text, reset.
-- **Presets**: save the whole look under a name, load, delete, **export** a text code and **import** one (share looks with friends). With `writefile`/`readfile` presets are kept in `NovaUI/presets.txt`; without them they last for the session (the page tells you which).
 - **Window**: keep-on-screen toggle.
 - **Executor check**: tests your executor's file / asset functions (UNC) and names the one that fails.
-- **Background**: see below.
+- **Background**: files, links, dim/glass, Match colours and **background presets** (save, load, delete, auto-load on start). See below.
 
 `Window:ToggleSettings()`, `SetSettingsOpen(bool)`, `IsSettingsOpen()` and the Kavo `ChangeColor` all work from code too.
 
@@ -143,7 +143,24 @@ It is a beta: colours update 5 times a second, and a button you are hovering kee
 
 `pip install lupa && python3 test/run_tests.py` runs the suite on a strict mock of the Roblox API (Lua 5.2 + `bit32`). It has not been run inside real Roblox.
 
-## Presets, executor blame, options (round 3)
-- Presets save hotkeys and every Toggle / Slider / Input / Dropdown / ColorPicker (matched by `Tab/Label`). Loading runs the callbacks of what changed; create the window with `PresetCallbacks = false` to skip that.
-- Dropdowns now have `:Get()` and `:Set(option, silent)`.
+## Background presets (the only presets)
+
+The settings page (⚙ → Background presets) saves the current background under a name, loads it, deletes it, and can load one by itself when the UI opens. From code:
+
+```lua
+Window:SaveBackgroundPreset("Night")        -- ok, message
+Window:LoadBackgroundPreset("Night")
+Window:DeleteBackgroundPreset("Night")
+Window:SetAutoBackgroundPreset("Night")     -- or nil to turn auto-load off
+Window:GetBackgroundPresets()               -- { "Night", ... }
+Window:GetAutoBackgroundPreset()            -- "Night" | nil
+```
+
+- Stored in `workspace/NovaUI/bg_presets.txt` (up to 40, names up to 24 characters; session only without `writefile`/`readfile`).
+- A preset holds the type, source (file name, asset id or link), dim, glass and Match colours. A folder video finds its `.map.txt` again. Pixels pictures and icons are not saved.
+- The user's auto-load preset replaces a script's `Background` option. Create the window with `AutoBackground = false` to keep the script's own.
+- **Removed in this version:** look presets (themes, colours, hotkeys, toggles, sliders...), look codes (export/import) and the `PresetCallbacks` option. NovaUI is a library for many different scripts, so what a script's controls are set to is the script's business. `Window:GetHotkeys()` / `SetHotkeys(map)` stay for scripts that want to keep hotkeys themselves.
+
+## Executor blame, options
+- Dropdowns have `:Get()` and `:Set(option, silent)`.
 - Executor functions are called through one wrapper: a failure names the function and says it is an executor (UNC) problem. `Library.GetExecutorIssues()` lists them; `Library.UNCTest()` runs the full check (also `unc_test.lua`).

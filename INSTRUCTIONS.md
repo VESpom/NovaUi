@@ -1,42 +1,36 @@
-# NovaUI: how to use presets, backgrounds and the executor check
+# NovaUI: how to use backgrounds, background presets and the executor check
 
 Written for you, step by step. Open the settings with the **⚙** button next to the close button.
 
 ---
 
-## 1. Presets (saving how your UI looks *and* how it is set)
+## 1. Background presets (and loading one by itself)
 
-A preset now remembers:
-
-| Remembered | Example |
-|---|---|
-| Every **toggle** (on/off) | "Fly" was ON |
-| Every **hotkey** of buttons, toggles and keybinds | the "Jump" button had **M** |
-| Every **slider**, **text box**, **dropdown**, **colour picker** | Speed 80, Name "bob", Team Blue |
-| Colours / theme, keep-on-screen, background | your Ocean look with a video behind it |
+NovaUI has **one kind of preset: for the background**. A background preset remembers a background (the video or picture, how dark it is, how see-through the buttons are, and the Match colours switch). It does **not** touch your script's toggles, sliders or hotkeys: this library is used for many different scripts, so those stay the script's business.
 
 ### Save one
-1. Set everything the way you want it.
-2. ⚙ → **Presets** → type a name → **Save preset**.
-3. The status line says `(kept on disk)`. If it says `this session only`, it also tells you which executor function failed (see section 3).
+1. Pick a background first (section 2).
+2. ⚙ → **Background presets** → type a name → **Save background preset**.
+3. The note says `(kept on disk)`. If it says `this session only`, it also tells you which executor function failed (see section 3).
 
 ### Load one
-⚙ → **Load preset** → pick the name. The status line tells you what came back, for example:
-`Loaded 'Mine': 7 settings, 3 hotkeys restored`.
+⚙ → **Load preset** → pick the name. The background changes right away.
 
-What loading does:
-- Toggles, sliders, dropdowns, text boxes and colours are put back **and your script's code for them runs**, but only for the ones that actually changed. So a toggle that was ON in the preset really turns the feature on.
-- **Buttons are never pressed.** Only their hotkey comes back.
-- Two hotkeys can swap keys inside one preset without a clash.
-- If a key is now used by something that is not in the preset, that hotkey is skipped and the status line says so (the old key stays).
-- Things the preset does not know (new buttons you added later) are left alone. Things the preset has but the script no longer has are counted as `not found in this script`.
+### Load one by itself when the UI opens
+1. Pick (or save) the preset you want in **Load preset**.
+2. Switch on **Auto-load this preset on start**. The note shows `Auto-load: 'Name'`.
+3. Next time the UI opens, that background is there without opening the settings.
 
-Script authors: to restore the look of controls **without** running their code, create the window with `PresetCallbacks = false`.
+- Only one preset can be the auto-load one. Selecting another preset shows the switch as off for it; switching it on there moves the auto-load to that preset.
+- Your choice wins over a script's own default background. Script authors who do not want that create the window with `AutoBackground = false`.
+- Deleting the auto-load preset turns auto-load off. Switch the toggle off to stop it any time.
+- Auto-load needs `writefile`/`readfile`. Without them it works only until you close the game (the note says so).
 
-### Where it lives and how to share it
-- File: `workspace/NovaUI/presets.txt` (inside your executor's folder). Up to 40 presets, names up to 24 characters.
-- **Export look (copy code)** copies one preset as a line of text. Paste it into **Look code** and press Enter on another computer.
-- Presets find their controls by **tab name + label** (for example `Main/Fly`). If you rename a label in the script, old presets will not find it.
+### Good to know
+- File: `workspace/NovaUI/bg_presets.txt`. Up to 40 presets, names up to 24 characters.
+- Only a **file name, asset id or link** can be saved. A Pixels picture or a game/avatar icon is too big or not a plain source, and the note says so.
+- Presets made by the old version (`presets.txt`, "look codes") are **not used any more**. Nothing is deleted: the old file just stays there, ignored.
+- Folder videos come back with their colour map (`intro.map.txt`) and the Match switch.
 
 ---
 
@@ -50,7 +44,7 @@ You do not need links or asset ids. Use the folder the executor gives you.
 3. Back in the UI press **Refresh files**, then pick the file in **Files in folder**.
 4. Use **Dim** and **Glass** if the buttons are hard to read.
 
-You can also type the file name (`intro.webm`) into **Source** and press Enter. Presets remember the file, so loading a preset brings the background back.
+You can also type the file name (`intro.webm`) into **Source** and press Enter. Background presets remember the file, so loading one brings the background back.
 
 ### Which files work
 
@@ -103,7 +97,7 @@ What to know:
 - Pictures work the same way: `wall.png` + `wall.map.txt`.
 - No map file? The switch stays off and the note tells you the exact command to run.
 - A broken map file (edited by hand, cut off) is explained in the note and the console, and the background still shows.
-- Presets remember it: loading a preset brings back the video, its map and the switch.
+- Background presets remember it: loading one brings back the video, its map and the switch.
 - A long video: the map covers 60 seconds by default. For a longer one add `--max-seconds 0` (the whole video). The tool warns you when the map is shorter than the video.
 
 ---
@@ -127,12 +121,12 @@ Each line is `PASS`, `FAIL`, `MISSING` or `SKIP`.
 | SKIP | Not tested because a function it depends on failed first |
 
 It also prints what that means for NovaUI, for example:
-`Presets saved to disk: limited by your executor: writefile (fail). Presets still work for this session only.`
+`Background presets saved to disk: limited by your executor: writefile (fail). Background presets still work for this session only, and cannot auto-load next time.`
 
 ### While you use NovaUI
 When an executor function fails, NovaUI shows it plainly, once per problem:
 
-`[NovaUI] presets: executor function 'writefile' failed: the executor refuses this kind of file ... (UNC / executor problem, not NovaUI's code)`
+`[NovaUI] background presets: executor function 'writefile' failed: the executor refuses this kind of file ... (UNC / executor problem, not NovaUI's code)`
 
 Script authors can read the list with `Library.GetExecutorIssues()`.
 
@@ -145,8 +139,8 @@ The test creates files named `_unc_test.*` in `workspace/NovaUI` and deletes the
 | Problem | Try this |
 |---|---|
 | Preset says "this session only" | Run the executor check and read which function failed |
-| Hotkey not restored | The status line counts skipped keys. Another element owns that key |
-| Toggle shows ON but the feature did not start | Your script was created with `PresetCallbacks = false` |
+| Auto-load does nothing next time | Same: it needs `writefile` / `readfile`. Also check the switch shows ON for that preset |
+| The script has its own background and ignores mine | It was created with `AutoBackground = false` |
 | Background stays plain | Use a `.webm` (VP8/VP9, up to 720p) and read the status text |
 | Folder list is empty | Press **Refresh files**. Only `.webm .mp4 .png .jpg .jpeg` are listed, and names may only use English letters, digits, spaces and `- . _ ( )` (no accents, no `;`) |
 | Video link does nothing | Put the file in the folder instead. Links need an executor with `writefile` and `getcustomasset` |
