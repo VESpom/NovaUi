@@ -1,148 +1,239 @@
-# NovaUI: how to use backgrounds, background presets and the executor check
+# NovaUI
 
-Written for you, step by step. Open the settings with the **⚙** button next to the close button.
+Same calls as Kavo UI Library. Only the look and the loadstring change.
 
----
+## Getting Loadstring
 
-## 1. Background presets (and loading one by itself)
-
-NovaUI has **one kind of preset: for the background**. A background preset remembers a background (the video or picture, how dark it is, how see-through the buttons are, and the Match colours switch). It does **not** touch your script's toggles, sliders or hotkeys: this library is used for many different scripts, so those stay the script's business.
-
-### Save one
-1. Pick a background first (section 2).
-2. ⚙ → **Background presets** → type a name → **Save background preset**.
-3. The note says `(kept on disk)`. If it says `this session only`, it also tells you which executor function failed (see section 3).
-
-### Load one
-⚙ → **Load preset** → pick the name. The background changes right away.
-
-### Load one by itself when the UI opens
-1. Pick (or save) the preset you want in **Load preset**.
-2. Switch on **Auto-load this preset on start**. The note shows `Auto-load: 'Name'`.
-3. Next time the UI opens, that background is there without opening the settings.
-
-- Only one preset can be the auto-load one. Selecting another preset shows the switch as off for it; switching it on there moves the auto-load to that preset.
-- Your choice wins over a script's own default background. Script authors who do not want that create the window with `AutoBackground = false`.
-- Deleting the auto-load preset turns auto-load off. Switch the toggle off to stop it any time.
-- Auto-load needs `writefile`/`readfile`. Without them it works only until you close the game (the note says so).
-
-### Good to know
-- File: `workspace/NovaUI/bg_presets.txt`. Up to 40 presets, names up to 24 characters.
-- Only a **file name, asset id or link** can be saved. A Pixels picture or a game/avatar icon is too big or not a plain source, and the note says so.
-- Presets made by the old version (`presets.txt`, "look codes") are **not used any more**. Nothing is deleted: the old file just stays there, ignored.
-- Folder videos come back with their colour map (`intro.map.txt`) and the Match switch.
-
----
-
-## 2. Backgrounds (the easy way: a folder)
-
-You do not need links or asset ids. Use the folder the executor gives you.
-
-### Steps
-1. Run your script and open ⚙ → **Background**. This creates the folder `workspace/NovaUI/backgrounds` for you.
-2. Copy your video or picture into that folder (on your computer, inside your executor's `workspace` folder).
-3. Back in the UI press **Refresh files**, then pick the file in **Files in folder**.
-4. Use **Dim** and **Glass** if the buttons are hard to read.
-
-You can also type the file name (`intro.webm`) into **Source** and press Enter. Background presets remember the file, so loading one brings the background back.
-
-### Which files work
-
-| File | Works | Notes |
-|---|---|---|
-| `.webm` (VP8 or VP9) | Best choice | Up to 720p, no sound needed, under 40 MB |
-| `.mp4` | Maybe | Roblox's video player is documented for VP8/VP9 webm. mp4 may stay plain |
-| `.png`, `.jpg` | Yes | Not `.webp` or `.gif` |
-
-Source for the video rule: a Roblox developer-forum answer from 2022 ([thread](https://devforum.roblox.com/t/what-type-of-filescodecs-do-videoframes-support/1659542)). It may have changed, so trust the 10-second hint below if they disagree.
-
-### Turn any video into a working `.webm`
-You need [ffmpeg](https://ffmpeg.org) and Python on your computer, and the file `tools/novaui_tool.py` from this repo. Then:
-
-```
-python3 tools/novaui_tool.py convert input.mp4
+```lua
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/VESpom/NovaUi/main/source.lua"))()
 ```
 
-It writes `input.webm` next to the original: VP8, no sound, at most 540 pixels tall (never enlarged). Copy it into `workspace/NovaUI/backgrounds`.
+## Creating UI Library Window
 
-- Too big or slow to load? Add `--bitrate 600k`, `--height 360` or `--fps 24`.
-- It never overwrites a file by accident; add `--force` to replace one.
-- If the file name has odd characters (like `!` or `;`) it is cleaned for you, because NovaUI only lists names with letters, digits, space and `- . _ ( )`.
+```lua
+local Window = Library.CreateLib("TITLE", "DarkTheme")
+```
 
-(Without the tool, the same result by hand: `ffmpeg -i input.mp4 -c:v libvpx -b:v 1M -vf scale=-2:540 -an output.webm`.)
+Themes:
+- LightTheme
+- DarkTheme
+- GrapeTheme
+- BloodTheme
+- Ocean
+- Midnight
+- Sentinel
+- Synapse
 
-### If the window stays plain
-- After 10 seconds without the video loading, NovaUI tells you in the settings and the console to convert it to `.webm`.
-- `file not found` means the name or folder is wrong. The message shows the exact path it looked for.
-- `executor function 'getcustomasset' ...` means your executor refused the file. Run the executor check (section 3).
-- No **Files in folder** list? Your executor has no `listfiles`. Type the file name in **Source** instead.
+## Creating Tabs
 
-### Other ways (still available)
-An asset id, an `https://` link (downloaded once into `workspace/NovaUI/`) or a small embedded picture (`Pixels`). See `README.md`.
+```lua
+local Tab = Window:NewTab("TabName")
+```
 
-### Match colours [beta]
-This makes buttons and text follow the colours behind them. Roblox cannot read the pixels of a playing video, so NovaUI needs a small **colour map file** made once on your computer. With a file in the folder it is simple:
+## Creating Section
 
-1. Make the map next to your video:
-   ```
-   python3 tools/novaui_tool.py colormap intro.webm --sidecar
-   ```
-   This creates `intro.map.txt`. (Or do both steps at once: `python3 tools/novaui_tool.py convert intro.mp4 --map`.)
-2. Put `intro.webm` **and** `intro.map.txt` in `workspace/NovaUI/backgrounds`. The map must have the same name as the video.
-3. Pick the video in ⚙ → **Background**. The note says **Colour map found (intro.map.txt)**.
-4. Switch on **Match colours [beta]**.
+```lua
+local Section = Tab:NewSection("Section Name")
+```
 
-What to know:
-- The `.map.txt` file does not show up in the file picker. That is normal; it is read together with the video.
-- Pictures work the same way: `wall.png` + `wall.map.txt`.
-- No map file? The switch stays off and the note tells you the exact command to run.
-- A broken map file (edited by hand, cut off) is explained in the note and the console, and the background still shows.
-- Background presets remember it: loading one brings back the video, its map and the switch.
-- A long video: the map covers 60 seconds by default. For a longer one add `--max-seconds 0` (the whole video). The tool warns you when the map is shorter than the video.
+## Update Section
+
+```lua
+Section:UpdateSection("Section New Title")
+```
+
+## Creating Labels
+
+```lua
+Section:NewLabel("LabelText")
+```
+
+## Update Label
+
+```lua
+label:UpdateLabel("New Text")
+```
+
+## Creating Buttons
+
+```lua
+Section:NewButton("ButtonText", "ButtonInfo", function()
+    print("Clicked")
+end)
+```
+
+## Update Button
+
+Make sure your button is local when updating it.
+
+```lua
+button:UpdateButton("New Text")
+```
+
+## Creating Toggles
+
+```lua
+Section:NewToggle("ToggleText", "ToggleInfo", function(state)
+    if state then
+        print("Toggle On")
+    else
+        print("Toggle Off")
+    end
+end)
+```
+
+## Updating Toggles
+
+```lua
+toggle:UpdateToggle("Toggle On")
+```
+
+## Creating Sliders
+
+```lua
+Section:NewSlider("SliderText", "SliderInfo", 500, 0, function(s) -- 500 (MaxValue) | 0 (MinValue)
+    print(s)
+end)
+```
+
+## Creating Textboxes
+
+```lua
+Section:NewTextBox("TextboxText", "TextboxInfo", function(txt)
+    print(txt)
+end)
+```
+
+## Creating Keybinds
+
+```lua
+Section:NewKeybind("KeybindText", "KeybindInfo", Enum.KeyCode.F, function()
+    print("You just clicked the bind")
+end)
+```
+
+## Toggling UI with Keybinds
+
+```lua
+Section:NewKeybind("KeybindText", "KeybindInfo", Enum.KeyCode.F, function()
+    Library:ToggleUI()
+end)
+```
+
+## Creating Dropdowns
+
+```lua
+Section:NewDropdown("DropdownText", "DropdownInfo", {"Option 1", "Option 2", "Option 3"}, function(currentOption)
+    print(currentOption)
+end)
+```
+
+## Dropdown Refresh
+
+```lua
+local dropdown = Section:NewDropdown("Dropdown", "Info", {"2019", "2020"}, function() end)
+
+Section:NewButton("Update Dropdown", "Refreshes Dropdown", function()
+    dropdown:Refresh({"2021", "2022"})
+end)
+```
+
+## Creating Color Pickers
+
+```lua
+Section:NewColorPicker("Color Text", "Color Info", Color3.fromRGB(0, 0, 0), function(color)
+    print(color)
+end)
+```
+
+## Applying Custom Themes / Colors
+
+Make a new table with your colors, then pass it instead of a theme name.
+
+```lua
+local colors = {
+    SchemeColor = Color3.fromRGB(64, 64, 64),
+    Background = Color3.fromRGB(0, 0, 0),
+    Header = Color3.fromRGB(0, 0, 0),
+    TextColor = Color3.fromRGB(255, 255, 255),
+    ElementColor = Color3.fromRGB(20, 20, 20)
+}
+
+local Window = Library.CreateLib("TITLE", colors)
+```
+
+Change one color later:
+
+```lua
+Library:ChangeColor("Background", Color3.fromRGB(10, 10, 10))
+```
+
+## Settings
+
+Press the **⚙** button next to the close button. It has themes, colors and backgrounds.
 
 ---
 
-## 3. Executor check (UNC)
+# Backgrounds
 
-NovaUI relies on file functions that belong to your **executor**, not to NovaUI (`writefile`, `readfile`, `isfile`, `isfolder`, `makefolder`, `listfiles`, `delfile`, `getcustomasset`, `setclipboard`). Executors implement them differently, and some are broken or blocked.
+You set the background yourself. Nothing is stored in GitHub. A background only works with a **Roblox asset id**: a number you get after uploading your own image or video to Roblox.
 
-### Run it
-- In the UI: ⚙ → **Executor check** → **Run executor check**. The summary appears there and the full list goes to the console.
-- Or paste `unc_test.lua` into your executor. It opens no window.
+## Image background
 
-### Read the result
-Each line is `PASS`, `FAIL`, `MISSING` or `SKIP`.
+1. Upload a **PNG or JPG** on Roblox (Creator Hub, Assets, Images).
+2. Copy the number of the image (the id).
+3. Use it:
 
-| Status | Meaning |
-|---|---|
-| PASS | The function works |
-| FAIL | The function exists but errors or returns wrong data. The line names it and gives the raw error |
-| MISSING | Your executor does not have it. Lines marked "optional" do not matter much |
-| SKIP | Not tested because a function it depends on failed first |
+```lua
+Window:SetBackground({ Image = 1234567890 })
+```
 
-It also prints what that means for NovaUI, for example:
-`Background presets saved to disk: limited by your executor: writefile (fail). Background presets still work for this session only, and cannot auto-load next time.`
+Not supported: webp and gif.
 
-### While you use NovaUI
-When an executor function fails, NovaUI shows it plainly, once per problem:
+## Video background
 
-`[NovaUI] background presets: executor function 'writefile' failed: the executor refuses this kind of file ... (UNC / executor problem, not NovaUI's code)`
+1. Make your video match **all** of these:
+   1. File type: **.mp4** or **.mov** (Roblox upload accepts these).
+   2. Length: **5 minutes at most**. Shorter is better, it loops.
+   3. Size: under **3.75 GB**. Aim for **under 50 MB**, so it loads fast.
+   4. Resolution: **1280x720 or smaller** is best. 1920x1080 works but is heavier.
+   5. Sound is not needed, NovaUI plays it muted.
+2. Upload it on Roblox (Creator Hub, Assets, Videos). Your account must be **13+** and **ID verified**, and Roblox charges **2,000 Robux per upload** at the time of writing ([Roblox docs](https://create.roblox.com/docs/ui/video-frames)).
+3. Copy the number of the video (the id).
+4. Use it:
 
-Script authors can read the list with `Library.GetExecutorIssues()`.
+```lua
+Window:SetBackground({ Video = 1234567890 })
+```
 
-The test creates files named `_unc_test.*` in `workspace/NovaUI` and deletes them. If your executor has no `delfile`, delete them by hand.
+## Make it readable
 
----
+```lua
+Window:SetBackground({ Video = 1234567890, Dim = 0.62, Glass = 0.2 })
+```
 
-## 4. Quick fixes
+- `Dim` makes the footage darker (0.35 to 0.95).
+- `Glass` makes buttons see-through (0 to 0.4).
 
-| Problem | Try this |
-|---|---|
-| Preset says "this session only" | Run the executor check and read which function failed |
-| Auto-load does nothing next time | Same: it needs `writefile` / `readfile`. Also check the switch shows ON for that preset |
-| The script has its own background and ignores mine | It was created with `AutoBackground = false` |
-| Background stays plain | Use a `.webm` (VP8/VP9, up to 720p) and read the status text |
-| Folder list is empty | Press **Refresh files**. Only `.webm .mp4 .png .jpg .jpeg` are listed, and names may only use English letters, digits, spaces and `- . _ ( )` (no accents, no `;`) |
-| Video link does nothing | Put the file in the folder instead. Links need an executor with `writefile` and `getcustomasset` |
+## Set it on start, or later
 
-Everything here was tested against a simulated Roblox and executor, not in a real executor. If something behaves differently on yours, the executor check shows whether your executor is the cause.
+```lua
+-- on start
+local Window = Library.CreateLib("TITLE", "DarkTheme", { Background = { Video = 1234567890 } })
+
+-- later
+Window:SetBackground({ Image = 1234567890 })
+Window:ClearBackground()
+```
+
+Or without code: **⚙ > Background**, type the id in **Source**, press Enter.
+
+## Save it
+
+**⚙ > Background > Background presets**: type a name, press **Save background preset**. Pick one in **Load preset** any time. Switch on **Auto-load this preset on start** and it comes back by itself next time.
+
+## If nothing shows
+
+1. The id must be a number from **your own upload** (or one Roblox lets your game use). Someone else's private asset will not load.
+2. Wait about 10 seconds. If the video did not load, NovaUI says so in the settings and in the console.
+3. Images: use the **image** id, not a decal id.
