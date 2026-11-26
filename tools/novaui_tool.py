@@ -5,6 +5,12 @@
       Makes a video Roblox can play: WebM (VP8), no sound, at most 540 px tall. Put the result in
       workspace/NovaUI/backgrounds. Add --map to also write the colour map file next to it.
 
+  anim     VIDEO [--fps 8] [--width 256] [--max-seconds 12] [--map] [--force]
+      Roblox often refuses video files that come from the executor's folder. This turns the video into
+      pictures (sprite sheets) that NovaUI flips through like a video. It writes  <name>.anim.txt  and
+      <name>.anim1.jpg, <name>.anim2.jpg ...  Put them all in workspace/NovaUI/backgrounds and pick
+      <name>.anim.txt. Add --map for Match colours.
+
   colormap VIDEO_OR_PICTURE [--cols 12 --rows 8 --fps 2 --max-seconds 60] [--out file.lua] [--sidecar]
       Samples the colours of every part of the picture over time, for "Match colours [beta]".
       --sidecar writes  <name>.map.txt  next to the file: put both in workspace/NovaUI/backgrounds and
@@ -227,6 +233,83 @@ def convert(path, out, height, bitrate, fps, force):
     return out
 
 
+MAX_ANIM_FRAMES = 240  # the library refuses longer animations
+ANIM_SHEET_PX = 1024  # Roblox shrinks bigger pictures, so a sheet never goes past this
+
+
+def anim_frame_count(path, fps, max_seconds):
+    """How many frames the fps filter really produces (counted, not guessed)."""
+    cmd = ["ffmpeg", "-v", "error", "-i", path]
+    if max_seconds:
+        cmd += ["-t", str(max_seconds)]
+    cmd += ["-vf", "fps=%s,scale=2:2,format=gray" % fps, "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    return len(run(cmd)) // 4
+
+
+def anim(path, fps, width, cols, rows, max_seconds, quality, make_map_file, force):
+    if not os.path.isfile(path):
+        sys.exit("file not found: " + path)
+    if not 0 < fps <= 30:
+        sys.exit("--fps must be above 0 and at most 30")
+    if not 32 <= width <= ANIM_SHEET_PX:
+        sys.exit("--width must be between 32 and %d" % ANIM_SHEET_PX)
+    if not 2 <= quality <= 31:
+        sys.exit("--quality must be between 2 (best) and 31 (smallest)")
+    w, h = probe_size(path)
+    fw = width
+    fh = max(2, int(round(width * h / float(w) / 2.0)) * 2)
+    if fh > ANIM_SHEET_PX:
+        sys.exit("that picture is too tall for a frame; use a smaller --width")
+    cols = cols or max(1, ANIM_SHEET_PX // fw)
+    rows = rows or max(1, ANIM_SHEET_PX // fh)
+    if cols * fw > ANIM_SHEET_PX or rows * fh > ANIM_SHEET_PX:
+        sys.exit("%d x %d frames of %dx%d is over %d px. Use fewer --cols/--rows or a smaller --width."
+                 % (cols, rows, fw, fh, ANIM_SHEET_PX))
+    stem, changed = safe_stem(path)
+    if changed:
+        sys.stderr.write("note: the name was cleaned to '%s'.\n" % stem)
+    folder = os.path.dirname(os.path.abspath(path))
+    manifest = os.path.join(folder, stem + ".anim.txt")
+    if os.path.exists(manifest) and not force:
+        sys.exit("%s already exists. Use --force to replace it." % manifest)
+    frames = anim_frame_count(path, fps, max_seconds)
+    if frames < 1:
+        sys.exit("no frames could be read")
+    if frames > MAX_ANIM_FRAMES:
+        warn("the video gives %d frames; NovaUI plays at most %d, so only the first %.0f s are used. "
+             "Use a lower --fps or --max-seconds." % (frames, MAX_ANIM_FRAMES, MAX_ANIM_FRAMES / float(fps)))
+        frames = MAX_ANIM_FRAMES
+        max_seconds = MAX_ANIM_FRAMES / float(fps)
+    per = cols * rows
+    sheets = -(-frames // per)
+    for old in os.listdir(folder):  # sheets of an older, longer run must not linger
+        if re.match(r"^%s\.anim\d+\.jpg$" % re.escape(stem), old):
+            os.remove(os.path.join(folder, old))
+    pattern = os.path.join(folder, stem + ".anim%d.jpg")
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", path]
+    if max_seconds:
+        cmd += ["-t", str(max_seconds)]
+    cmd += ["-vf", "fps=%s,scale=%d:%d:flags=lanczos,tile=%dx%d" % (fps, fw, fh, cols, rows),
+            "-frames:v", str(sheets), "-q:v", str(quality), "-start_number", "1", pattern]
+    run(cmd)
+    made = [f for f in (pattern % (i + 1) for i in range(sheets)) if os.path.isfile(f)]
+    if len(made) != sheets:
+        sys.exit("expected %d sheet(s) but ffmpeg wrote %d" % (sheets, len(made)))
+    write_text(manifest, "NVANIM1 cols=%d rows=%d fw=%d fh=%d fps=%s frames=%d\n" % (cols, rows, fw, fh, ("%g" % fps), frames))
+    total = sum(os.path.getsize(f) for f in made)
+    sys.stderr.write("wrote %s + %d sheet(s) (%d frames of %dx%d, %.1f s, %.2f MB)\n"
+                     % (manifest, sheets, frames, fw, fh, frames / float(fps), total / 1e6))
+    if total > 8e6:
+        warn("over 8 MB of pictures: loading will be slow. Use a lower --fps, --width or a higher --quality number.")
+    if make_map_file:
+        mf = os.path.join(folder, stem + ".map.txt")
+        body_frames, mc, mr = make_map(path, 12, 8, 2.0, max_seconds or 0)
+        write_text(mf, text_map(body_frames, mc, mr, 2.0))
+        sys.stderr.write("wrote %s  (%d colour frame(s))\n" % (mf, len(body_frames)))
+    sys.stderr.write("Put all of these in workspace/NovaUI/backgrounds, then pick %s.\n" % os.path.basename(manifest))
+    return manifest
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -244,6 +327,16 @@ def main():
     c.add_argument("--out")
     c.add_argument("--sidecar", action="store_true",
                    help="write <file name>.map.txt next to the file (NovaUI finds it by itself)")
+    a = sub.add_parser("anim")
+    a.add_argument("file")
+    a.add_argument("--fps", type=float, default=8.0, help="frames per second (default 8; more = smoother but bigger)")
+    a.add_argument("--width", type=int, default=256, help="width of one frame in pixels (default 256)")
+    a.add_argument("--cols", type=int, help="frames per row on a sheet (default: fill 1024 px)")
+    a.add_argument("--rows", type=int, help="rows per sheet (default: fill 1024 px)")
+    a.add_argument("--max-seconds", type=float, default=12.0, help="how much of the video to use (0 = all, default 12)")
+    a.add_argument("--quality", type=int, default=5, help="JPEG quality number, 2 best .. 31 smallest (default 5)")
+    a.add_argument("--map", action="store_true", help="also write the colour map file (Match colours)")
+    a.add_argument("--force", action="store_true", help="replace an earlier result")
     v = sub.add_parser("convert")
     v.add_argument("file")
     v.add_argument("--out", help="default: <name>.webm next to the original")
@@ -257,6 +350,9 @@ def main():
     if args.cmd == "pixels":
         text, w, h = pixels(args.file, args.size, parse_bg(args.bg))
         note = "-- NovaUI pixels picture %dx%d\n" % (w, h)
+    elif args.cmd == "anim":
+        anim(args.file, args.fps, args.width, args.cols, args.rows, args.max_seconds, args.quality, args.map, args.force)
+        return
     elif args.cmd == "convert":
         out = convert(args.file, args.out, args.height, args.bitrate, args.fps, args.force)
         if args.map:
